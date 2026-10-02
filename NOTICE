@@ -1,0 +1,38 @@
+tierlm
+Copyright 2026 the tierlm authors (https://github.com/jbennie/tierlm)
+
+This product is licensed under the Apache License, Version 2.0 (see LICENSE).
+
+No source code from any other project is included in this repository. The
+library in src/ was written from the pseudocode fragments in fragments/, which
+describe, in our own words, designs and measured results observed in the
+projects below, and from public format specifications (GGUF block layouts,
+safetensors, OCP Microscaling MX, IEEE/OCP FP8). Each fragment's "Origin:"
+line records which project(s) it came from. The consensus scoring in
+fragments/CONSENSUS.md counts how many independent projects converge on each
+pattern.
+
+Projects studied (tag, repository, licence at time of reading, Oct 2026):
+
+  colibri        https://github.com/JustVugg/colibri              Apache-2.0
+  ds4            https://github.com/antirez/ds4                   MIT
+  pulsar         https://github.com/giannisanni/pulsar            MIT
+  monolite       https://github.com/Pioshin/monolite              Apache-2.0
+  slipstream     https://github.com/Schero94/slipstream           MIT
+  ktransformers  https://github.com/kvcache-ai/ktransformers      Apache-2.0
+  apus           https://github.com/bricesommers/apus-glm5.3-flash PolyForm-NC-1.0.0
+  flashmoe       https://github.com/danveloper/flash-moe          no licence
+
+Two of the studied projects are not open-source licensed for general use
+(apus: PolyForm Noncommercial; flashmoe: no licence). They were read for
+experimental research only. Fragments whose only origin is [apus] or
+[flashmoe] are marked as such; review fragments/CONSENSUS.md before relying on
+a pattern with a single non-commercial or unlicensed origin in a commercial
+setting.
+
+The expert-pruning criterion follows the published REAP method
+(https://github.com/CerebrasResearch/reap, arXiv:2510.13999).
+
+The decision-engine design (src/lib/tlm_decide.*) follows the publicly
+described typed-question interface of the Jev family of decision models
+(Choice, Score, Noul); no model weights or code from them are included.

@@ -1,0 +1,9 @@
+{
+  "recommendations": [
+    "ms-vscode.cpptools",
+    "ms-vscode.makefile-tools",
+    "timonwong.shellcheck",
+    "davidanson.vscode-markdownlint",
+    "anthropic.claude-code"
+  ]
+}

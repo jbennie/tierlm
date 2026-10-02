@@ -1,0 +1,15 @@
+-std=c11
+-D_GNU_SOURCE
+-Isrc/lib
+-Itests
+-Wall
+-Wextra
+-Wno-unused-parameter
+-mavx2
+-mfma
+-mf16c
+-mavx512f
+-mavx512bw
+-mavx512vl
+-mavx512vnni
+-mavx512dq

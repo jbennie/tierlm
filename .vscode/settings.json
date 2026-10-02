@@ -1,0 +1,66 @@
+{
+  "files.associations": {
+    "*.h": "c",
+    "*.mk": "makefile",
+    "*.conf": "properties",
+    "*.conf.example": "properties"
+  },
+  "files.exclude": {
+    "build*/": true
+  },
+  "search.exclude": {
+    "build*/": true,
+    "scratch/": true
+  },
+  "files.watcherExclude": {
+    "**/build*/**": true,
+    "**/scratch/**": true
+  },
+  "files.trimTrailingWhitespace": true,
+  "files.insertFinalNewline": true,
+  "editor.rulers": [
+    100
+  ],
+  "[c]": {
+    "editor.tabSize": 4,
+    "editor.insertSpaces": true,
+    "editor.formatOnSave": false
+  },
+  "[makefile]": {
+    "editor.insertSpaces": false,
+    "editor.detectIndentation": false
+  },
+  "[markdown]": {
+    "editor.wordWrap": "on"
+  },
+  "C_Cpp.default.cStandard": "c11",
+  "C_Cpp.default.intelliSenseMode": "linux-gcc-x64",
+  "C_Cpp.default.includePath": [
+    "${workspaceFolder}/src/lib",
+    "${workspaceFolder}/tests"
+  ],
+  "C_Cpp.default.defines": [
+    "_GNU_SOURCE"
+  ],
+  "makefile.configurations": [
+    {
+      "name": "generic",
+      "makeArgs": []
+    },
+    {
+      "name": "wrx90",
+      "makeArgs": [
+        "PROFILE=wrx90"
+      ]
+    },
+    {
+      "name": "asan",
+      "makeArgs": [
+        "BUILD=build-asan",
+        "OPTFLAGS=-O1 -fsanitize=address,undefined -fno-omit-frame-pointer",
+        "LDLIBS=-lm -pthread -fsanitize=address,undefined"
+      ]
+    }
+  ],
+  "makefile.launchConfigurations": []
+}

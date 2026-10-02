@@ -1,0 +1,147 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "build",
+      "type": "shell",
+      "command": "make -j$(nproc)",
+      "group": {
+        "kind": "build",
+        "isDefault": true
+      },
+      "problemMatcher": [
+        "$gcc"
+      ]
+    },
+    {
+      "label": "build (debug -O0)",
+      "type": "shell",
+      "command": "make -j$(nproc) BUILD=build-debug OPTFLAGS=-O0 all $(ls tests/test_*.c | sed 's|tests/\\(.*\\)\\.c|build-debug/tests/\\1|')",
+      "group": "build",
+      "problemMatcher": [
+        "$gcc"
+      ]
+    },
+    {
+      "label": "build (wrx90 profile)",
+      "type": "shell",
+      "command": "make -j$(nproc) PROFILE=wrx90 BUILD=build-wrx90",
+      "group": "build",
+      "problemMatcher": [
+        "$gcc"
+      ]
+    },
+    {
+      "label": "test",
+      "type": "shell",
+      "command": "make -j$(nproc) test",
+      "group": {
+        "kind": "test",
+        "isDefault": true
+      },
+      "problemMatcher": [
+        "$gcc"
+      ]
+    },
+    {
+      "label": "test: asan + ubsan",
+      "type": "shell",
+      "command": "make -j$(nproc) asan",
+      "group": "test",
+      "problemMatcher": [
+        "$gcc"
+      ]
+    },
+    {
+      "label": "test: tsan",
+      "type": "shell",
+      "command": "make -j$(nproc) tsan",
+      "group": "test",
+      "problemMatcher": [
+        "$gcc"
+      ]
+    },
+    {
+      "label": "test: one unit test",
+      "type": "shell",
+      "command": "make -j$(nproc) build/tests/${input:unitTest} && build/tests/${input:unitTest}",
+      "group": "test",
+      "problemMatcher": [
+        "$gcc"
+      ]
+    },
+    {
+      "label": "test: end-to-end only",
+      "type": "shell",
+      "command": "make -j$(nproc) bins && sh tests/e2e.sh",
+      "group": "test",
+      "problemMatcher": []
+    },
+    {
+      "label": "demo model (scratch/)",
+      "type": "shell",
+      "command": "scripts/demo-model.sh ${input:profile}",
+      "problemMatcher": [
+        "$gcc"
+      ]
+    },
+    {
+      "label": "run demo model",
+      "type": "shell",
+      "command": "TIERLM_ETC=scratch/etc build/bin/tierlm run scratch/demo.tlmm --prompt Hello -n 32 --stats",
+      "dependsOn": "build",
+      "problemMatcher": []
+    },
+    {
+      "label": "bench demo model",
+      "type": "shell",
+      "command": "TIERLM_ETC=scratch/etc build/bin/tierlm bench scratch/demo.tlmm --prompt-len 64 -n 64",
+      "dependsOn": "build",
+      "problemMatcher": []
+    },
+    {
+      "label": "setup: dry run (no writes)",
+      "type": "shell",
+      "command": "build/bin/tierlm-setup --etc scratch/etc --dry-run --probe-seconds 2",
+      "dependsOn": "build",
+      "problemMatcher": []
+    },
+    {
+      "label": "clean",
+      "type": "shell",
+      "command": "make clean && rm -rf build-wrx90 build-debug",
+      "problemMatcher": []
+    }
+  ],
+  "inputs": [
+    {
+      "id": "unitTest",
+      "type": "pickString",
+      "description": "Unit test",
+      "options": [
+        "test_cfg",
+        "test_decide",
+        "test_io",
+        "test_json",
+        "test_model",
+        "test_packet",
+        "test_pool",
+        "test_quant",
+        "test_st",
+        "test_store"
+      ],
+      "default": "test_store"
+    },
+    {
+      "id": "profile",
+      "type": "pickString",
+      "description": "Compile profile",
+      "options": [
+        "exact",
+        "balanced",
+        "aggressive"
+      ],
+      "default": "exact"
+    }
+  ]
+}

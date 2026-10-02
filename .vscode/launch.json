@@ -1,0 +1,209 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "tierlm run (demo model)",
+      "type": "cppdbg",
+      "request": "launch",
+      "program": "${workspaceFolder}/build-debug/bin/tierlm",
+      "args": [
+        "run",
+        "scratch/demo.tlmm",
+        "--prompt",
+        "Hello",
+        "-n",
+        "16",
+        "--stats",
+        "--threads",
+        "1"
+      ],
+      "cwd": "${workspaceFolder}",
+      "stopAtEntry": false,
+      "MIMode": "gdb",
+      "preLaunchTask": "build (debug -O0)",
+      "environment": [
+        {
+          "name": "TIERLM_ETC",
+          "value": "${workspaceFolder}/scratch/etc"
+        }
+      ],
+      "setupCommands": [
+        {
+          "description": "pretty printing",
+          "text": "-enable-pretty-printing",
+          "ignoreFailures": true
+        }
+      ]
+    },
+    {
+      "name": "tierlm run, tiny cache, scalar kernels (demo)",
+      "type": "cppdbg",
+      "request": "launch",
+      "program": "${workspaceFolder}/build-debug/bin/tierlm",
+      "args": [
+        "run",
+        "scratch/demo.tlmm",
+        "--prompt",
+        "Hello",
+        "-n",
+        "16",
+        "--cache",
+        "1",
+        "--kernel",
+        "scalar",
+        "--stats"
+      ],
+      "cwd": "${workspaceFolder}",
+      "stopAtEntry": false,
+      "MIMode": "gdb",
+      "preLaunchTask": "build (debug -O0)",
+      "environment": [
+        {
+          "name": "TIERLM_ETC",
+          "value": "${workspaceFolder}/scratch/etc"
+        }
+      ],
+      "setupCommands": [
+        {
+          "description": "pretty printing",
+          "text": "-enable-pretty-printing",
+          "ignoreFailures": true
+        }
+      ]
+    },
+    {
+      "name": "tlmc compile (demo, balanced)",
+      "type": "cppdbg",
+      "request": "launch",
+      "program": "${workspaceFolder}/build-debug/bin/tlmc",
+      "args": [
+        "compile",
+        "scratch/src",
+        "--out",
+        "scratch/demo-balanced.tlmm",
+        "--drives",
+        "scratch/nvme0,scratch/nvme1,scratch/nvme2,scratch/nvme3",
+        "--profile",
+        "balanced"
+      ],
+      "cwd": "${workspaceFolder}",
+      "stopAtEntry": false,
+      "MIMode": "gdb",
+      "preLaunchTask": "build (debug -O0)",
+      "environment": [
+        {
+          "name": "TIERLM_ETC",
+          "value": "${workspaceFolder}/scratch/etc"
+        }
+      ],
+      "setupCommands": [
+        {
+          "description": "pretty printing",
+          "text": "-enable-pretty-printing",
+          "ignoreFailures": true
+        }
+      ]
+    },
+    {
+      "name": "tlmc report (demo)",
+      "type": "cppdbg",
+      "request": "launch",
+      "program": "${workspaceFolder}/build-debug/bin/tlmc",
+      "args": [
+        "report",
+        "scratch/demo.tlmm"
+      ],
+      "cwd": "${workspaceFolder}",
+      "stopAtEntry": false,
+      "MIMode": "gdb",
+      "preLaunchTask": "build (debug -O0)",
+      "environment": [
+        {
+          "name": "TIERLM_ETC",
+          "value": "${workspaceFolder}/scratch/etc"
+        }
+      ],
+      "setupCommands": [
+        {
+          "description": "pretty printing",
+          "text": "-enable-pretty-printing",
+          "ignoreFailures": true
+        }
+      ]
+    },
+    {
+      "name": "tierlm-setup --dry-run",
+      "type": "cppdbg",
+      "request": "launch",
+      "program": "${workspaceFolder}/build-debug/bin/tierlm-setup",
+      "args": [
+        "--etc",
+        "scratch/etc",
+        "--dry-run",
+        "--probe-seconds",
+        "2"
+      ],
+      "cwd": "${workspaceFolder}",
+      "stopAtEntry": false,
+      "MIMode": "gdb",
+      "preLaunchTask": "build (debug -O0)",
+      "environment": [
+        {
+          "name": "TIERLM_ETC",
+          "value": "${workspaceFolder}/scratch/etc"
+        }
+      ],
+      "setupCommands": [
+        {
+          "description": "pretty printing",
+          "text": "-enable-pretty-printing",
+          "ignoreFailures": true
+        }
+      ]
+    },
+    {
+      "name": "unit test (pick)",
+      "type": "cppdbg",
+      "request": "launch",
+      "program": "${workspaceFolder}/build-debug/tests/${input:unitTest}",
+      "args": [],
+      "cwd": "${workspaceFolder}",
+      "stopAtEntry": false,
+      "MIMode": "gdb",
+      "preLaunchTask": "build (debug -O0)",
+      "environment": [
+        {
+          "name": "TIERLM_ETC",
+          "value": "${workspaceFolder}/scratch/etc"
+        }
+      ],
+      "setupCommands": [
+        {
+          "description": "pretty printing",
+          "text": "-enable-pretty-printing",
+          "ignoreFailures": true
+        }
+      ]
+    }
+  ],
+  "inputs": [
+    {
+      "id": "unitTest",
+      "type": "pickString",
+      "description": "Unit test",
+      "options": [
+        "test_cfg",
+        "test_decide",
+        "test_io",
+        "test_json",
+        "test_model",
+        "test_packet",
+        "test_pool",
+        "test_quant",
+        "test_st",
+        "test_store"
+      ],
+      "default": "test_store"
+    }
+  ]
+}

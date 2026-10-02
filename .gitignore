@@ -1,0 +1,24 @@
+# build trees (make BUILD=..., make asan/tsan)
+/build/
+/build-*/
+
+# compiled objects outside a build tree
+*.o
+*.a
+*.so
+
+# editor / tooling caches
+/.cache/
+/compile_commands.json
+.vscode/*.log
+.vscode/ipch/
+*.swp
+*~
+.DS_Store
+
+# local scratch: synthetic models, compiled stores, drive dirs used while experimenting
+/scratch/
+/models/
+*.tlmm
+*.tlmp
+*.work/

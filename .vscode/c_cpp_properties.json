@@ -1,0 +1,14 @@
+{
+  "configurations": [
+    {
+      "name": "Linux (tierlm)",
+      "includePath": ["${workspaceFolder}/src/lib", "${workspaceFolder}/tests"],
+      "defines": ["_GNU_SOURCE", "HAVE_LIBURING=1"],
+      "compilerPath": "/usr/bin/gcc",
+      "compilerArgs": ["-mavx2", "-mfma", "-mf16c", "-mavx512f", "-mavx512bw", "-mavx512vl", "-mavx512vnni", "-mavx512dq"],
+      "cStandard": "c11",
+      "intelliSenseMode": "linux-gcc-x64"
+    }
+  ],
+  "version": 4
+}
