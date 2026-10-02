@@ -1,0 +1,138 @@
+#!/bin/sh
+# tests/e2e.sh - end-to-end check of the two stages (research/03-two-stage-design.md):
+#   synth -> compile exact over 3 drive dirs -> run with a tiny and a large
+#   cache (outputs must be equal) -> recompile (resume reuses passes 2-3) ->
+#   compile balanced with pruning + q5_k plan -> report -> atlas -> run ->
+#   compile aggressive with a content exclusion -> config show/check ->
+#   missing-drive refusal.
+# Honours BUILD (default: build). Uses only a temporary directory.
+set -eu
+
+BUILD=${BUILD:-build}
+B=$BUILD/bin
+for x in tlmc tierlm; do
+    [ -x "$B/$x" ] || { echo "e2e: $B/$x not built (make BUILD=$BUILD bins)" >&2; exit 1; }
+done
+
+T=$(mktemp -d "${TMPDIR:-/tmp}/tlm-e2e.XXXXXX")
+trap 'rm -rf "$T"' EXIT INT TERM
+mkdir -p "$T/etc"
+TIERLM_ETC=$T/etc          # never read the machine's /etc/tierlm
+export TIERLM_ETC
+
+fail() { echo "e2e: FAIL: $*" >&2; exit 1; }
+step() { echo "e2e: $*"; }
+run_logged() {             # run_logged LOG cmd... : keep output, show it on failure
+    log=$1; shift
+    if ! "$@" >"$log" 2>&1; then cat "$log" >&2; fail "$*"; fi
+}
+
+step "synth a tiny Qwen3-MoE-like checkpoint"
+run_logged "$T/synth.log" "$B/tlmc" synth --out "$T/src" --layers 3 --experts 16 --top-k 2 --shared 1 --seed 7
+[ -s "$T/src/model.safetensors" ] && [ -s "$T/src/config.json" ] || fail "synth wrote no model"
+
+step "compile (exact) over 3 drive dirs"
+D3="$T/nvme0,$T/nvme1,$T/nvme2"
+run_logged "$T/exact.log" "$B/tlmc" compile "$T/src" --out "$T/models/exact.tlmm" --drives "$D3" \
+    --profile exact --replicas auto
+grep -q "bit-identical logits yes, greedy free run identical yes" "$T/exact.log" || fail "exact not identical to pass 2"
+for d in 0 1 2; do [ -s "$T/nvme$d/exact.tlmp" ] || fail "drive $d has no packet file"; done
+[ -s "$T/models/exact.work/ref/exact.tlmp" ] || fail "no pass-2 scratch store"
+[ -s "$T/models/exact.work/decisions.jsonl" ] || fail "no decision audit log"
+grep -q "replicated (warm middle)" "$T/exact.log" || fail "no placement summary"
+
+step "run: tiny cache (top_k slots) vs large cache must match"
+P="Hello, tiered world"
+run_logged "$T/tiny.out" "$B/tierlm" run "$T/models/exact.tlmm" --prompt "$P" -n 24 --cache 1 --print-tokens --stats
+run_logged "$T/large.out" "$B/tierlm" run "$T/models/exact.tlmm" --prompt "$P" -n 24 --cache 1G --threads 1 \
+    --prefetch off --print-tokens
+grep -v -e '^--' -e '^[a-z]' -e '^  drive' -e 'tierlm warn' "$T/tiny.out" > "$T/tiny.tok"
+cp "$T/large.out" "$T/large.tok"
+[ "$(wc -w < "$T/large.tok")" -eq 24 ] || fail "expected 24 tokens, got: $(cat "$T/large.tok")"
+cmp -s "$T/tiny.tok" "$T/large.tok" || { cat "$T/tiny.tok" "$T/large.tok" >&2; fail "tiny and large cache differ"; }
+grep -q "hit rate" "$T/tiny.out" || fail "--stats printed nothing"
+run_logged "$T/scalar.out" "$B/tierlm" run "$T/models/exact.tlmm" --prompt "$P" -n 24 --kernel scalar \
+    --io io_uring --direct yes --print-tokens
+cmp -s "$T/scalar.out" "$T/large.tok" || fail "scalar kernel tier / io_uring request changed the tokens"
+run_logged "$T/tok.out" "$B/tierlm" run "$T/models/exact.tlmm" --tokens 72,101,108 -n 4 --print-tokens
+[ "$(wc -w < "$T/tok.out")" -eq 4 ] || fail "--tokens run"
+run_logged "$T/bench.out" "$B/tierlm" bench "$T/models/exact.tlmm" --prompt-len 16 -n 16
+grep -q "tok/s" "$T/bench.out" || fail "bench"
+
+step "recompile (exact): passes 2 and 3 resume from the work dir"
+run_logged "$T/exact2.log" "$B/tlmc" compile "$T/src" --out "$T/models/exact.tlmm" --drives "$D3" --profile exact
+grep -q "reference store .*\[reused\]" "$T/exact2.log" || fail "pass 2 not reused"
+grep -q "calibrated on .*\[reused\]" "$T/exact2.log" || fail "pass 3 not reused"
+run_logged "$T/again.out" "$B/tierlm" run "$T/models/exact.tlmm" --prompt "$P" -n 24 --print-tokens
+cmp -s "$T/again.out" "$T/large.tok" || fail "recompiled store gives different tokens"
+
+step "compile (balanced): REAP pruning on a text corpus, gated"
+for f in docs/DISTILLED.md research/03-two-stage-design.md research/04-decision-engine.md; do
+    [ -f "$f" ] && cat "$f"
+done > "$T/corpus.txt" || true
+[ -s "$T/corpus.txt" ] || "$B/tlmc" --help > "$T/corpus.txt" 2>&1 || true
+mkdir -p "$T/etc-bal"
+printf 'experts.protect = 0:1, 2:3\n' > "$T/etc-bal/tierlm.conf"
+run_logged "$T/bal.log" "$B/tlmc" compile "$T/src" --out "$T/models/bal.tlmm" --drives "$D3" \
+    --profile balanced --corpus "$T/corpus.txt" --calib-tokens 3072 --eval-tokens 768 --etc "$T/etc-bal" --report
+grep -q '"profile":"balanced"' "$T/bal.log" || fail "--report did not print the report"
+NP=$(sed -n 's/^prune  *\([0-9][0-9]*\) of .*/\1/p' "$T/bal.log")
+[ -n "$NP" ] && [ "$NP" -gt 0 ] || fail "balanced compile pruned nothing"
+grep -q "attempt .*-> pass" "$T/bal.log" || fail "no passing gate attempt"
+
+step "report + atlas"
+run_logged "$T/report.out" "$B/tlmc" report "$T/models/bal.tlmm"
+grep -q "^prune  *$NP of" "$T/report.out" || fail "report disagrees with compile"
+grep -q "^validate" "$T/report.out" || fail "report has no validation"
+run_logged "$T/report.json" "$B/tlmc" report "$T/models/bal.tlmm" --json
+grep -q '"experts":\[\[' "$T/report.json" || fail "report JSON has no expert atlas"
+run_logged "$T/atlas.out" "$B/tlmc" atlas "$T/models/bal.tlmm" --sort heat --top 8
+[ "$(grep -c '^[0-9]*:[0-9]' "$T/atlas.out")" -eq 8 ] || fail "atlas --top 8"
+run_logged "$T/atlas1.out" "$B/tlmc" atlas "$T/models/bal.tlmm" --layer 1
+[ "$(grep -c '^1:[0-9]' "$T/atlas1.out")" -eq 16 ] || fail "atlas --layer 1"
+run_logged "$T/atlas-all.out" "$B/tlmc" atlas "$T/models/bal.tlmm"
+[ "$(grep -c 'pruned$' "$T/atlas-all.out")" -eq "$NP" ] || fail "atlas pruned count differs from the report"
+grep -q -e "^0:1 .*pruned" -e "^2:3 .*pruned" "$T/atlas-all.out" && fail "a protected expert was pruned" || true
+
+step "run the pruned store (tiny vs large cache)"
+run_logged "$T/bt.out" "$B/tierlm" run "$T/models/bal.tlmm" --prompt "$P" -n 16 --cache 1 --print-tokens
+run_logged "$T/bl.out" "$B/tierlm" run "$T/models/bal.tlmm" --prompt "$P" -n 16 --print-tokens --stats
+tokens_only() { grep -v -e '^--' -e '^[a-z]' -e '^  drive' "$1"; }
+tokens_only "$T/bt.out" > "$T/bt.tok"
+tokens_only "$T/bl.out" > "$T/bl.tok"
+[ "$(wc -w < "$T/bl.tok")" -eq 16 ] || fail "expected 16 tokens from the pruned store"
+cmp -s "$T/bt.tok" "$T/bl.tok" || fail "pruned store: tiny and large cache differ"
+
+step "compile (aggressive): content exclusion + q5_k plan, 2 drives, no replicas"
+mkdir -p "$T/etc-agg"
+printf 'content.default = exclude\nprune.max_ratio = 0.4\n' > "$T/etc-agg/tierlm.conf"
+# probed drive bandwidth (tierlm-setup --probe facts): nvme1 is 3x faster
+printf 'hardware.drive.count = 2\nhardware.drive.0.path = %s\nhardware.drive.0.direct_gbs = 1.0\nhardware.drive.1.path = %s\nhardware.drive.1.direct_gbs = 3.0\n' \
+    "$T/nvme0" "$T/nvme1" > "$T/etc-agg/hardware.conf"
+run_logged "$T/agg.log" "$B/tlmc" compile "$T/src" --out "$T/models/agg.tlmm" --drives "$T/nvme0,$T/nvme1" \
+    --profile aggressive --replicas none --etc "$T/etc-agg" --dense f16
+grep -q "0 replicated" "$T/agg.log" || fail "--replicas none still replicated"
+grep -q -e "experts demoted to q5_k" -e "q5_k plan rolled back by the gate" "$T/agg.log" || fail "no q5_k precision plan"
+grep -q "^precision   dense f16" "$T/agg.log" || fail "--dense f16 ignored"
+S0=$(sed -n 's/^  drive 0 .* \([0-9][0-9]*\)% of expected expert reads$/\1/p' "$T/agg.log")
+S1=$(sed -n 's/^  drive 1 .* \([0-9][0-9]*\)% of expected expert reads$/\1/p' "$T/agg.log")
+[ -n "$S0" ] && [ -n "$S1" ] && [ "$S1" -gt "$S0" ] || fail "placement ignored probed bandwidth ($S0% vs $S1%)"
+run_logged "$T/agg.out" "$B/tierlm" run "$T/models/agg.tlmm" --prompt "$P" -n 8 --print-tokens
+[ "$(wc -w < "$T/agg.out")" -eq 8 ] || fail "aggressive run"
+
+step "config show / check"
+printf 'cpu.threads = 2\nio.prefetch = off\n' > "$T/etc/tierlm.conf"
+run_logged "$T/cfg.out" "$B/tierlm" config show --origin
+grep -q "^cpu.threads  *= 2 .*# file" "$T/cfg.out" || fail "config show --origin"
+run_logged "$T/chk.out" "$B/tierlm" config check
+printf 'cpu.threads = many\n' > "$T/etc/tierlm.conf"
+if "$B/tierlm" config check > "$T/chk2.out" 2>&1; then fail "config check accepted a bad value"; fi
+rm -f "$T/etc/tierlm.conf"
+
+step "a missing drive without replicas is refused"
+mv "$T/nvme2/exact.tlmp" "$T/nvme2/exact.tlmp.away"
+if "$B/tierlm" run "$T/models/exact.tlmm" -n 2 > "$T/miss.out" 2>&1; then fail "ran with a missing drive"; fi
+grep -q "missing" "$T/miss.out" || { cat "$T/miss.out" >&2; fail "unclear missing-drive error"; }
+mv "$T/nvme2/exact.tlmp.away" "$T/nvme2/exact.tlmp"
+
+echo "e2e: ok"
