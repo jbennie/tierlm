@@ -153,4 +153,25 @@ if "$B/tierlm" run "$T/models/exact.tlmm" -n 2 > "$T/miss.out" 2>&1; then fail "
 grep -q "missing" "$T/miss.out" || { cat "$T/miss.out" >&2; fail "unclear missing-drive error"; }
 mv "$T/nvme2/exact.tlmp.away" "$T/nvme2/exact.tlmp"
 
+step "synth + compile + run a YaRN rope_scaling model"
+run_logged "$T/yarn.log" "$B/tlmc" synth --out "$T/src-yarn" --layers 3 --experts 16 --top-k 2 --shared 1 --seed 7 --yarn
+grep -q '"rope_type": "yarn"' "$T/src-yarn/config.json" || fail "synth --yarn wrote no rope_scaling"
+run_logged "$T/yc.log" "$B/tlmc" compile "$T/src-yarn" --out "$T/models/yarn.tlmm" --drives "$T/nvme0" --profile exact
+run_logged "$T/yr.out" "$B/tlmc" report "$T/models/yarn.tlmm"
+grep -q "yarn x4" "$T/yr.out" || fail "report has no rope line"
+run_logged "$T/yr.json" "$B/tlmc" report "$T/models/yarn.tlmm" --json
+grep -q '"rope":{"type":"yarn-truncate"' "$T/yr.json" || fail "report JSON lost the rope geometry"
+run_logged "$T/yt.out" "$B/tierlm" run "$T/models/yarn.tlmm" --prompt "$P" -n 16 --cache 1 --print-tokens
+run_logged "$T/yl.out" "$B/tierlm" run "$T/models/yarn.tlmm" --prompt "$P" -n 16 --print-tokens
+tokens_only "$T/yt.out" > "$T/yt.tok"
+tokens_only "$T/yl.out" > "$T/yl.tok"
+[ "$(wc -w < "$T/yl.tok")" -eq 16 ] || fail "yarn run"
+cmp -s "$T/yt.tok" "$T/yl.tok" || fail "yarn store: tiny and large cache differ"
+cp -r "$T/src-yarn" "$T/src-bad"
+sed 's/"rope_type": "yarn"/"rope_type": "linear"/' "$T/src-yarn/config.json" > "$T/src-bad/config.json"
+if "$B/tlmc" compile "$T/src-bad" --out "$T/models/bad.tlmm" --drives "$T/nvme0" --profile exact > "$T/bad.out" 2>&1; then
+    fail "compile accepted an unsupported rope type"
+fi
+grep -q "not supported" "$T/bad.out" || { cat "$T/bad.out" >&2; fail "no rope rejection message"; }
+
 echo "e2e: ok"

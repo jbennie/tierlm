@@ -521,24 +521,30 @@ void tlm_writer_free(tlm_store_writer *w) {
 static void put_geom(uint8_t *p, const tlm_model_geom *g) {
     memcpy(p, g->arch, 32);
     p[31] = 0;
-    const uint32_t v[17] = {g->n_layers, g->d_model,   g->n_heads,  g->n_kv_heads,
+    const uint32_t v[22] = {g->n_layers, g->d_model,   g->n_heads,  g->n_kv_heads,
                             g->head_dim, g->vocab,     g->n_experts, g->top_k,
                             g->d_expert, g->n_shared,  g->d_shared, g->max_ctx,
                             g->router,   f2u(g->rope_theta), f2u(g->norm_eps),
-                            f2u(g->routed_scale), g->mtp_layers};
-    for (int i = 0; i < 17; i++) put32(p + 32 + 4 * i, v[i]);
+                            f2u(g->routed_scale), g->mtp_layers,
+                            g->rope_scale, f2u(g->rope_factor),
+                            f2u(g->rope_beta_fast), f2u(g->rope_beta_slow),
+                            g->rope_orig_len};
+    for (int i = 0; i < 22; i++) put32(p + 32 + 4 * i, v[i]);
 }
 
 static void get_geom(const uint8_t *p, tlm_model_geom *g) {
     memset(g, 0, sizeof *g);
     memcpy(g->arch, p, 32);
-    uint32_t v[17];
-    for (int i = 0; i < 17; i++) v[i] = get32(p + 32 + 4 * i);
+    uint32_t v[22];
+    for (int i = 0; i < 22; i++) v[i] = get32(p + 32 + 4 * i);
     g->n_layers = v[0]; g->d_model = v[1]; g->n_heads = v[2]; g->n_kv_heads = v[3];
     g->head_dim = v[4]; g->vocab = v[5]; g->n_experts = v[6]; g->top_k = v[7];
     g->d_expert = v[8]; g->n_shared = v[9]; g->d_shared = v[10]; g->max_ctx = v[11];
     g->router = v[12]; g->rope_theta = u2f(v[13]); g->norm_eps = u2f(v[14]);
     g->routed_scale = u2f(v[15]); g->mtp_layers = v[16];
+    g->rope_scale = v[17]; g->rope_factor = u2f(v[18]);
+    g->rope_beta_fast = u2f(v[19]); g->rope_beta_slow = u2f(v[20]);
+    g->rope_orig_len = v[21];
 }
 
 static void put_rec(uint8_t *p, const tlm_packet_loc *l) {

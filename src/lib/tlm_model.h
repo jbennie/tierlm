@@ -37,6 +37,16 @@ tlm_model *tlm_model_open(const tlm_manifest *m, tlm_io *io, tlm_store *store,
 void       tlm_model_close(tlm_model *mdl);
 const tlm_model_geom *tlm_model_geom_of(const tlm_model *mdl);
 
+/* Apply HF YaRN (transformers' modeling_rope_utils._compute_yarn_parameters)
+ * to a plain RoPE inv_freq table [head_dim/2] in place. The f32 arithmetic
+ * mirrors HF's float32 path: the correction range (floor/ceil when
+ * `truncate` is set) is computed in double, the ramp and the
+ * extrapolate/interpolate mix in f32. `*attn_factor` receives the cos/sin
+ * attention scale (1 + 0.1*ln(factor) for factor > 1, else 1.0). */
+int tlm_yarn_transform(float *inv_freq, int half, uint32_t head_dim, double theta,
+                       double factor, double beta_fast, double beta_slow,
+                       uint32_t orig_len, int truncate, float *attn_factor);
+
 /* KV cache for one sequence. */
 typedef struct tlm_kv tlm_kv;
 tlm_kv *tlm_kv_new(const tlm_model *mdl, int max_ctx);

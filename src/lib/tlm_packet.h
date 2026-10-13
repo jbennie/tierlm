@@ -21,7 +21,7 @@ extern "C" {
 
 #define TLM_PACKET_MAGIC   0x504D4C54u   /* "TLMP" little-endian */
 #define TLM_MANIFEST_MAGIC 0x4D4D4C54u   /* "TLMM" */
-#define TLM_STORE_VERSION  1u
+#define TLM_STORE_VERSION  2u
 #define TLM_MAX_DRIVES     16
 #define TLM_LAYER_NONE     0xFFFFu
 
@@ -89,6 +89,9 @@ typedef struct {
     uint32_t router;             /* 0 = softmax top-k renorm, 1 = softmax top-k no renorm, 2 = sigmoid+bias renorm */
     float    rope_theta, norm_eps, routed_scale;
     uint32_t mtp_layers;         /* 0 if no MTP head */
+    uint32_t rope_scale;         /* 0 = plain RoPE, 1 = YaRN (truncate), 2 = YaRN (no truncate) */
+    float    rope_factor, rope_beta_fast, rope_beta_slow;   /* YaRN parameters */
+    uint32_t rope_orig_len;      /* YaRN: original_max_position_embeddings */
 } tlm_model_geom;
 
 typedef struct {

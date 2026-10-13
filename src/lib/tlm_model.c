@@ -85,7 +85,8 @@ struct tlm_model {
     uint8_t       *meta_buf, *embed_buf;
     expert_info   *ex;           /* [n_layers * n_experts] */
     uint8_t       *mask;         /* 1 = pruned, [n_layers * n_experts] */
-    float         *inv_freq;     /* [head_dim / 2] */
+    float         *inv_freq;     /* [head_dim / 2] (YaRN-corrected if configured) */
+    float          rope_attn_scale;   /* cos/sin scale (1.0 unless YaRN) */
     float        **owned;        /* converted vectors to free */
     int            n_owned, cap_owned;
 
@@ -419,6 +420,39 @@ static int alloc_scratch(tlm_model *M) {
     return TLM_OK;
 }
 
+/* HF YaRN (transformers' modeling_rope_utils._compute_yarn_parameters,
+ * float32 path): rewrites the plain inv_freq table in place and returns the
+ * cos/sin attention scale. The correction range is computed in double
+ * (floor/ceil when `truncate`), the ramp and the extrapolate/interpolate
+ * mix in f32, mirroring HF's torch float32 arithmetic. */
+#define TLM_TWO_PI 6.283185307179586
+int tlm_yarn_transform(float *inv_freq, int half, uint32_t head_dim, double theta,
+                       double factor, double beta_fast, double beta_slow,
+                       uint32_t orig_len, int truncate, float *attn_factor) {
+    if (!inv_freq || !attn_factor || head_dim < 2 || (head_dim & 1) ||
+        half != (int)(head_dim / 2) || !(theta > 0.0) || !(factor > 0.0) ||
+        !(beta_fast > 0.0) || beta_fast < beta_slow || orig_len == 0)
+        return tlm_seterr(TLM_EINVAL, "yarn: invalid rope scaling parameters");
+    double low = (double)head_dim * log((double)orig_len / (beta_fast * TLM_TWO_PI)) / (2.0 * log(theta));
+    double high = (double)head_dim * log((double)orig_len / (beta_slow * TLM_TWO_PI)) / (2.0 * log(theta));
+    if (truncate) { low = floor(low); high = ceil(high); }
+    if (low < 0.0) low = 0.0;
+    if (high > (double)head_dim - 1.0) high = (double)head_dim - 1.0;
+    if (low == high) high += 0.001;
+    double af = factor > 1.0 ? 0.1 * log(factor) + 1.0 : 1.0;
+    for (int j = 0; j < half; j++) {
+        float extrap = inv_freq[j];
+        float pos_freq = 1.0f / extrap;
+        float interp = 1.0f / ((float)factor * pos_freq);
+        float ramp = ((float)j - (float)low) / (float)(high - low);
+        if (ramp < 0.0f) ramp = 0.0f;
+        if (ramp > 1.0f) ramp = 1.0f;
+        inv_freq[j] = interp * ramp + extrap * (1.0f - ramp);
+    }
+    *attn_factor = (float)af;
+    return TLM_OK;
+}
+
 tlm_model *tlm_model_open(const tlm_manifest *m, tlm_io *io, tlm_store *store, tlm_pool *pool,
                           const tlm_model_opts *o) {
     if (!m || !io) { tlm_seterr(TLM_EINVAL, "model: manifest and io are required"); return NULL; }
@@ -427,7 +461,7 @@ tlm_model *tlm_model_open(const tlm_manifest *m, tlm_io *io, tlm_store *store, t
         g->head_dim == 0 || (g->head_dim & 1) || g->n_heads % g->n_kv_heads || g->vocab == 0 ||
         g->top_k > MAX_TOPK || g->top_k > g->n_experts || (g->n_experts > 0 && g->top_k == 0) ||
         (g->n_experts > 0 && g->d_expert == 0) || g->router > 2 || g->n_experts > 65536 ||
-        g->n_layers > 4096) {
+        g->n_layers > 4096 || g->rope_scale > 2) {
         tlm_seterr(TLM_EFORMAT, "model: unsupported geometry (layers %u, d_model %u, heads %u/%u, "
                    "head_dim %u, experts %u, top_k %u, router %u)", g->n_layers, g->d_model,
                    g->n_heads, g->n_kv_heads, g->head_dim, g->n_experts, g->top_k, g->router);
@@ -460,6 +494,16 @@ tlm_model *tlm_model_open(const tlm_manifest *m, tlm_io *io, tlm_store *store, t
     if (!M->L || !M->ex || !M->mask || !M->inv_freq) { rc = tlm_seterr(TLM_ENOMEM, "out of memory"); goto fail; }
     for (uint32_t j = 0; j < g->head_dim / 2; j++)   /* F-fwd-03: built once, in double */
         M->inv_freq[j] = (float)pow((double)M->g.rope_theta, -2.0 * (double)j / (double)g->head_dim);
+    M->rope_attn_scale = 1.0f;
+    if (M->g.rope_scale != 0) {
+        float af;
+        if ((rc = tlm_yarn_transform(M->inv_freq, (int)(g->head_dim / 2), g->head_dim,
+                                     (double)M->g.rope_theta, (double)M->g.rope_factor,
+                                     (double)M->g.rope_beta_fast, (double)M->g.rope_beta_slow,
+                                     g->rope_orig_len, M->g.rope_scale == 1, &af)))
+            goto fail;
+        M->rope_attn_scale = af;
+    }
 
     for (uint32_t l = 0; l < g->n_layers && rc == TLM_OK; l++) rc = load_layer(M, m, (int)l);
     if (rc) goto fail;
@@ -915,8 +959,8 @@ int tlm_model_step(tlm_model *M, tlm_kv *kv, int token, float *logits) {
         return tlm_seterr(TLM_EUNSUP, "cannot dequantise embedding dtype %d", (int)M->embd.dt);
     for (int j = 0; j < hd / 2; j++) {
         double a = (double)pos * (double)M->inv_freq[j];
-        M->cs[j] = (float)cos(a);
-        M->sn[j] = (float)sin(a);
+        M->cs[j] = (float)cos(a) * M->rope_attn_scale;
+        M->sn[j] = (float)sin(a) * M->rope_attn_scale;
     }
     if (M->o.lookahead > 0) lookahead(M, 0);
     int rc = TLM_OK;

@@ -404,7 +404,7 @@ static void test_tamper_detection(void) {
         CHECK_EQ_INT(fix_hashes(img, n), 0);         /* n_packets absurd vs table_len */
         CHECK_EQ_INT(load_image(img, n, &m), TLM_EFORMAT);
 
-        memcpy(img, raw, n); img[4] = 2;              /* future version */
+        memcpy(img, raw, n); img[4] = (uint8_t)(TLM_STORE_VERSION + 1); /* future version */
         CHECK_EQ_INT(fix_hashes(img, n), 0);
         CHECK_EQ_INT(load_image(img, n, &m), TLM_EFORMAT);
         CHECK(strstr(tlm_errmsg(), "version") != NULL);

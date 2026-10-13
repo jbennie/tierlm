@@ -269,6 +269,7 @@ static void st_put(tlm_st_writer *w, const char *name, float *data, int ndim, in
 static int cmd_synth(int argc, char **argv) {
     long L = 4, D = 256, H = 4, KV = 2, hd = 64, E = 16, K = 2, de = 256, shared = 1, V = 512;
     long seed = 1, qk = 1, router = 0, fp8 = 0;
+    int yarn = 0;
     const char *out = NULL;
     for (int i = 2; i < argc; i++) {
         const char *a = argv[i];
@@ -295,6 +296,8 @@ static int cmd_synth(int argc, char **argv) {
             if (tlm_cfg_parse_bool(v, &b)) die("--qk-norm: yes or no");
             qk = b;
         } else if (!strcmp(a, "--fp8")) fp8 = 1;
+        else if (!strcmp(a, "--yarn"))
+            yarn = 1;
         else die("synth: unknown option %s", a);
     }
     if (!out) die("synth: --out DIR is required");
@@ -390,18 +393,26 @@ static int cmd_synth(int argc, char **argv) {
             "  \"num_experts\": %ld,\n  \"num_experts_per_tok\": %ld,\n  \"moe_intermediate_size\": %ld,\n"
             "  \"shared_expert_intermediate_size\": %ld,\n  \"n_shared_experts\": %ld,\n"
             "  \"norm_topk_prob\": true,\n  \"scoring_func\": \"%s\",\n  \"routed_scaling_factor\": %s,\n"
-            "  \"rms_norm_eps\": 1e-06,\n  \"rope_theta\": 1000000.0,\n  \"max_position_embeddings\": 4096,\n"
+            "  \"rms_norm_eps\": 1e-06,\n  \"rope_theta\": 1000000.0,\n",
+            V, D, L, H, KV, hd, E, K, de, S, shared, router == 2 ? "sigmoid" : "softmax",
+            router == 2 ? "2.5" : "1.0");
+    if (yarn)
+        fprintf(f,
+                "  \"rope_scaling\": {\"rope_type\": \"yarn\", \"factor\": 4.0, "
+                "\"original_max_position_embeddings\": 1024, \"beta_fast\": 32.0, "
+                "\"beta_slow\": 1.0, \"truncate\": true},\n");
+    fprintf(f,
+            "  \"max_position_embeddings\": 4096,\n"
             "  \"decoder_sparse_step\": 1,\n  \"mlp_only_layers\": [],\n  \"tie_word_embeddings\": false,\n"
             "  \"torch_dtype\": \"%s\",\n  \"tierlm_synthetic\": {\"seed\": %ld, \"generator\": \"tlmc %s\", "
             "\"fp8\": %s}\n}\n",
-            V, D, L, H, KV, hd, E, K, de, S, shared, router == 2 ? "sigmoid" : "softmax",
-            router == 2 ? "2.5" : "1.0", fp8 ? "float8_e4m3fn" : "float32", seed, TLMC_VERSION,
+            fp8 ? "float8_e4m3fn" : "float32", seed, TLMC_VERSION,
             fp8 ? "true" : "false");
     if (fclose(f)) die("%s: write error", path);
     printf("tlmc: synthetic model in %s (%ld layers, d_model %ld, %ld experts top-%ld, d_expert %ld, "
-           "shared %ld, vocab %ld, %s router%s)\n",
+           "shared %ld, vocab %ld, %s router%s%s)\n",
            out, L, D, E, K, de, S, V, router == 2 ? "sigmoid" : "softmax",
-           fp8 ? ", FP8 E4M3 with 128x128 block scales" : "");
+           fp8 ? ", FP8 E4M3 with 128x128 block scales" : "", yarn ? ", YaRN x4" : "");
     return 0;
 }
 
@@ -829,8 +840,29 @@ static void pass_ingest(cc *c) {
     if (tlm_jint(jget(r, "decoder_sparse_step"), 1) != 1 || tlm_jlen(jget(r, "mlp_only_layers")) > 0 ||
         tlm_jint(jget(r, "first_k_dense_replace"), 0) > 0)
         die("ingest: dense FFN layers are not supported by the tlm-moe decoder yet");
-    if (jget(r, "rope_scaling") && jget(r, "rope_scaling")->type == TLM_J_OBJ)
-        fprintf(stderr, "tlmc: warning: rope_scaling is ignored (plain RoPE, F-fwd-03)\n");
+    if (jget(r, "rope_scaling") && jget(r, "rope_scaling")->type == TLM_J_OBJ) {
+        const tlm_jval *rs = jget(r, "rope_scaling");
+        const char *rt = tlm_jstr(jget(rs, "rope_type"), tlm_jstr(jget(rs, "type"), "default"));
+        if (!strcmp(rt, "default"))
+            die("ingest: rope_scaling of type 'default' must be omitted from the config");
+        if (strcmp(rt, "yarn") != 0)
+            die("ingest: rope_scaling type '%s' is not supported (only 'yarn')", rt);
+        if (jget(rs, "attention_factor") || jget(rs, "mscale") || jget(rs, "mscale_all_dim"))
+            die("ingest: explicit rope attention factor (attention_factor/mscale) is not supported");
+        double factor = tlm_jnum(jget(rs, "factor"), 0.0);
+        int64_t orig = tlm_jint(jget(rs, "original_max_position_embeddings"), 0);
+        if (!(factor >= 1.0) || orig <= 0)
+            die("ingest: rope_scaling requires 'factor' >= 1 and 'original_max_position_embeddings' > 0");
+        double beta_fast = tlm_jnum(jget(rs, "beta_fast"), 32.0);
+        double beta_slow = tlm_jnum(jget(rs, "beta_slow"), 1.0);
+        if (!(beta_fast > 0.0) || beta_fast < beta_slow)
+            die("ingest: rope_scaling requires 0 < beta_slow <= beta_fast");
+        g->rope_factor = (float)factor;
+        g->rope_beta_fast = (float)beta_fast;
+        g->rope_beta_slow = (float)beta_slow;
+        g->rope_orig_len = (uint32_t)orig;
+        g->rope_scale = tlm_jbool(jget(rs, "truncate"), 1) ? 1 : 2;
+    }
     tlm_json_free(j);
     if (!g->n_layers || !g->d_model || !g->n_heads || !g->n_kv_heads || !g->head_dim || !g->vocab ||
         !g->n_experts || !g->top_k || !g->d_expert || g->top_k > g->n_experts || g->n_experts > MAX_E ||
@@ -1789,6 +1821,15 @@ static char *build_report(cc *c, const tlm_manifest *m) {
     tlm_jw_int(&w, "d_expert", g->d_expert);
     tlm_jw_int(&w, "d_shared", g->d_shared);
     tlm_jw_str(&w, "router", g->router == 2 ? "sigmoid+bias" : g->router == 1 ? "softmax-topk" : "softmax-topk-renorm");
+    if (g->rope_scale) {
+        tlm_jw_key_obj(&w, "rope");
+        tlm_jw_str(&w, "type", g->rope_scale == 1 ? "yarn-truncate" : "yarn");
+        tlm_jw_num(&w, "factor", (double)g->rope_factor);
+        tlm_jw_num(&w, "beta_fast", (double)g->rope_beta_fast);
+        tlm_jw_num(&w, "beta_slow", (double)g->rope_beta_slow);
+        tlm_jw_int(&w, "original_max", (int64_t)g->rope_orig_len);
+        tlm_jw_end_obj(&w);
+    }
     tlm_jw_end_obj(&w);
     tlm_jw_key_obj(&w, "precision");
     tlm_jw_str(&w, "dense", tlm_dtype_name(c->dense_dt));
@@ -2118,6 +2159,9 @@ static void print_summary(const tlm_manifest *m, FILE *out) {
             "vocab %u, router %s\n", g->n_layers, g->d_model, g->n_heads, g->n_kv_heads, g->head_dim, g->n_experts,
             g->top_k, g->d_expert, g->d_shared, g->vocab,
             g->router == 2 ? "sigmoid+bias" : g->router == 1 ? "softmax top-k" : "softmax top-k renorm");
+    if (g->rope_scale)
+        fprintf(out, "rope        yarn x%g, original_max %u%s\n", g->rope_factor, g->rope_orig_len,
+                g->rope_scale == 1 ? ", truncate" : "");
     if (r) {
         const tlm_jval *p = jget(r, "precision");
         fprintf(out, "precision   dense %s, experts %s, router/norms f32", tlm_jstr(jget(p, "dense"), "?"),

@@ -40,6 +40,9 @@ typedef struct {
     tlm_dtype expert_dt[3];   /* expert e uses expert_dt[e % 3] */
     uint32_t prune_mask;      /* bit e: expert e of layer 0 flagged pruned in the manifest */
     unsigned seed;
+    uint32_t rope_scale;      /* 0 = plain, 1 = YaRN truncate, 2 = YaRN no-truncate */
+    float rope_factor, rope_beta_fast, rope_beta_slow;
+    uint32_t rope_orig_len;
 } spec;
 
 typedef struct {   /* f32 copies (dequantised) for the reference */
@@ -226,6 +229,9 @@ static int build(synth *S, const spec *sp, const char *name) {
     g->n_shared = ds > 0 ? 1 : 0; g->d_shared = (uint32_t)ds; g->max_ctx = 256;
     g->router = (uint32_t)sp->router; g->rope_theta = 10000.0f; g->norm_eps = 1e-6f;
     g->routed_scale = sp->routed_scale;
+    g->rope_scale = sp->rope_scale; g->rope_factor = sp->rope_factor;
+    g->rope_beta_fast = sp->rope_beta_fast; g->rope_beta_slow = sp->rope_beta_slow;
+    g->rope_orig_len = sp->rope_orig_len;
     m.n_drives = (uint32_t)sp->n_drives;
     for (int i = 0; i < sp->n_drives; i++) snprintf(m.drives[i], sizeof m.drives[i], "%s", dirs[i]);
     m.n_packets = (uint32_t)nl;
@@ -254,6 +260,8 @@ typedef struct {
     const synth *S;
     double *K, *Vc;      /* [L][pos][KV*hd] */
     int pos;
+    double inv[32];      /* RoPE inverse frequencies (YaRN-corrected when set) */
+    double af;           /* attention scale (1.0 unless YaRN) */
 } ref_state;
 
 static void r_rms(double *out, const double *x, const float *w, int n) {
@@ -269,12 +277,31 @@ static void r_mv(double *y, const float *W, const double *x, int rows, int cols)
         y[r] = s;
     }
 }
-static void r_rope(double *v, int pos, int hd) {
+static void r_rope(double *v, int pos, int hd, const double *inv, double af) {
     for (int j = 0; j < hd / 2; j++) {
-        double f = pow(10000.0, -2.0 * j / hd), a = pos * f, c = cos(a), s = sin(a);
+        double a = pos * inv[j], c = cos(a) * af, s = sin(a) * af;
         double x0 = v[j], x1 = v[j + hd / 2];
         v[j] = x0 * c - x1 * s;
         v[j + hd / 2] = x1 * c + x0 * s;
+    }
+}
+/* double port of HF _compute_yarn_parameters (same formulas as the C f32 path). */
+static void ref_yarn(double *inv, int half, int hd, double theta, double factor,
+                     double bf, double bs, uint32_t orig, int trunc, double *af) {
+    double low = (double)hd * log((double)orig / (bf * 6.283185307179586)) / (2.0 * log(theta));
+    double high = (double)hd * log((double)orig / (bs * 6.283185307179586)) / (2.0 * log(theta));
+    if (trunc) { low = floor(low); high = ceil(high); }
+    if (low < 0.0) low = 0.0;
+    if (high > hd - 1.0) high = (double)hd - 1.0;
+    if (low == high) high += 0.001;
+    *af = factor > 1.0 ? 0.1 * log(factor) + 1.0 : 1.0;
+    for (int j = 0; j < half; j++) {
+        double extrap = inv[j], pos_freq = 1.0 / extrap;
+        double interp = 1.0 / (factor * pos_freq);
+        double ramp = ((double)j - low) / (high - low);
+        if (ramp < 0.0) ramp = 0.0;
+        if (ramp > 1.0) ramp = 1.0;
+        inv[j] = interp * ramp + extrap * (1.0 - ramp);
     }
 }
 static double r_silu(double x) { return x / (1.0 + exp(-x)); }
@@ -284,6 +311,11 @@ static void ref_step(ref_state *st, int token, float *logits, const uint8_t *mas
     const spec *sp = &S->s;
     int D = sp->D, H = sp->H, KV = sp->KV, hd = sp->hd, E = sp->E, K = sp->K, de = sp->de, ds = sp->ds;
     int pos = st->pos;
+    for (int j = 0; j < hd / 2; j++) st->inv[j] = pow(10000.0, -2.0 * j / hd);
+    st->af = 1.0;
+    if (sp->rope_scale)
+        ref_yarn(st->inv, hd / 2, hd, 10000.0, sp->rope_factor, sp->rope_beta_fast,
+                 sp->rope_beta_slow, sp->rope_orig_len, sp->rope_scale == 1, &st->af);
     double *h = calloc((size_t)D, sizeof(double)), *x = calloc((size_t)D, sizeof(double));
     double *q = calloc((size_t)H * hd, sizeof(double)), *k = calloc((size_t)KV * hd, sizeof(double));
     double *v = calloc((size_t)KV * hd, sizeof(double)), *att = calloc((size_t)H * hd, sizeof(double));
@@ -299,8 +331,8 @@ static void ref_step(ref_state *st, int token, float *logits, const uint8_t *mas
         r_mv(v, R->v, x, KV * hd, D);
         for (int hh = 0; hh < H && R->q_norm; hh++) r_rms(q + hh * hd, q + hh * hd, R->q_norm, hd);
         for (int hh = 0; hh < KV && R->k_norm; hh++) r_rms(k + hh * hd, k + hh * hd, R->k_norm, hd);
-        for (int hh = 0; hh < H; hh++) r_rope(q + hh * hd, pos, hd);
-        for (int hh = 0; hh < KV; hh++) r_rope(k + hh * hd, pos, hd);
+        for (int hh = 0; hh < H; hh++) r_rope(q + hh * hd, pos, hd, st->inv, st->af);
+        for (int hh = 0; hh < KV; hh++) r_rope(k + hh * hd, pos, hd, st->inv, st->af);
         double *Kl = st->K + ((size_t)l * 256) * KV * hd, *Vl = st->Vc + ((size_t)l * 256) * KV * hd;
         memcpy(Kl + (size_t)pos * KV * hd, k, sizeof(double) * KV * hd);
         memcpy(Vl + (size_t)pos * KV * hd, v, sizeof(double) * KV * hd);
@@ -486,8 +518,9 @@ static void check_reference(int router, float routed_scale, int qk_norm, int ds)
     rt_cfg c = {2, 4, 1, 0.0, 0};
     if (rt_open(&r, &S, &c)) { fprintf(stderr, "  open: %s\n", tlm_errmsg()); CHECK(0); synth_free(&S); return; }
     tlm_kv *kv = tlm_kv_new(r.mdl, 32);
-    ref_state st = {&S, calloc((size_t)s.L * 256 * s.KV * s.hd, sizeof(double)),
-                    calloc((size_t)s.L * 256 * s.KV * s.hd, sizeof(double)), 0};
+    ref_state st = (ref_state){ .S = &S,
+                                .K = calloc((size_t)s.L * 256 * s.KV * s.hd, sizeof(double)),
+                                .Vc = calloc((size_t)s.L * 256 * s.KV * s.hd, sizeof(double)) };
     float lg[64], lr[64];
     const int toks[8] = {1, 7, 49, 0, 22, 7, 7, 3};
     double worst = 0;
@@ -513,7 +546,162 @@ static void test_reference_f32(void) {
     check_reference(1, 1.0f, 0, 0);     /* softmax top-k, no renorm, no qk-norm, no shared */
     check_reference(2, 2.5f, 1, 32);    /* sigmoid + selection bias, renorm, routed scale */
 }
+/* fixtures from an independent f32 port of HF _compute_yarn_parameters
+ * (scratch/yarn_ref.py, written against transformers/modeling_rope_utils.py) */
+static const float plain64[32] = {
+    1.0f, 0.749894202f, 0.562341332f, 0.421696514f, 0.316227764f, 0.237137377f, 0.177827939f, 0.133352146f,
+    0.100000001f, 0.0749894232f, 0.0562341325f, 0.0421696492f, 0.0316227749f, 0.0237137377f, 0.0177827943f, 0.013335214f,
+    0.00999999978f, 0.00749894232f, 0.00562341325f, 0.00421696482f, 0.00316227763f, 0.00237137382f, 0.00177827943f, 0.00133352145f,
+    0.00100000005f, 0.000749894185f, 0.000562341302f, 0.000421696517f, 0.000316227757f, 0.00023713737f, 0.00017782794f, 0.00013335215f,
+};
+static const float yarn_a[32] = {  /* factor 4, truncate, orig 512 */
+    1.0f, 0.749894202f, 0.562341332f, 0.421696514f, 0.297983855f, 0.209775373f, 0.147050023f, 0.102578573f,
+    0.0711538419f, 0.0490315482f, 0.0335241929f, 0.0227067322f, 0.0152032562f, 0.0100327339f, 0.00649755914f, 0.0041031423f,
+    0.00249999994f, 0.00187473558f, 0.00140585331f, 0.00105424121f, 0.000790569349f, 0.000592843455f, 0.000444569858f, 0.000333380362f,
+    0.000250000012f, 0.000187473546f, 0.000140585325f, 0.000105424137f, 7.90569393e-05f, 5.92843462e-05f, 4.44569851e-05f, 3.33380376e-05f,
+};
+static const float yarn_b[32] = {  /* factor 4, no truncate, orig 512 */
+    1.0f, 0.749894202f, 0.562341332f, 0.421696514f, 0.301406473f, 0.211252615f, 0.147340879f, 0.102184072f,
+    0.0703986362f, 0.0481207296f, 0.0325828493f, 0.0218071025f, 0.014383357f, 0.00930895936f, 0.00587311294f, 0.00357361417f,
+    0.00249999994f, 0.00187473558f, 0.00140585331f, 0.00105424121f, 0.000790569349f, 0.000592843455f, 0.000444569858f, 0.000333380362f,
+    0.000250000012f, 0.000187473546f, 0.000140585325f, 0.000105424137f, 7.90569393e-05f, 5.92843462e-05f, 4.44569851e-05f, 3.33380376e-05f,
+};
+static const float yarn_c[32] = {  /* factor 1 (no-op except f32 rounding), truncate */
+    1.0f, 0.749894202f, 0.562341332f, 0.421696514f, 0.316227764f, 0.237137377f, 0.177827939f, 0.133352146f,
+    0.099999994f, 0.0749894232f, 0.0562341288f, 0.0421696492f, 0.0316227749f, 0.0237137359f, 0.0177827943f, 0.0133352131f,
+    0.00999999978f, 0.00749894232f, 0.00562341325f, 0.00421696482f, 0.0031622774f, 0.00237137382f, 0.00177827943f, 0.00133352145f,
+    0.00100000005f, 0.000749894185f, 0.000562341302f, 0.000421696546f, 0.000316227757f, 0.000237137385f, 0.00017782794f, 0.00013335215f,
+};
 
+static void test_yarn_table(void) {
+    tlm_log_level(TLM_LOG_ERROR);
+    float in[32], af = 0.0f;
+    memcpy(in, plain64, sizeof in);
+    CHECK_EQ_INT(tlm_yarn_transform(in, 32, 64, 10000.0, 4.0, 32.0, 1.0, 512, 1, &af), 0);
+    if (memcmp(in, yarn_a, sizeof in)) fprintf(stderr, "  yarn truncate fixture mismatch\n");
+    CHECK(memcmp(in, yarn_a, sizeof in) == 0);
+    CHECK(af == 1.13862944f);
+    memcpy(in, plain64, sizeof in);
+    CHECK_EQ_INT(tlm_yarn_transform(in, 32, 64, 10000.0, 4.0, 32.0, 1.0, 512, 0, &af), 0);
+    CHECK(memcmp(in, yarn_b, sizeof in) == 0);
+    CHECK(af == 1.13862944f);
+    memcpy(in, plain64, sizeof in);
+    CHECK_EQ_INT(tlm_yarn_transform(in, 32, 64, 10000.0, 1.0, 32.0, 1.0, 512, 1, &af), 0);
+    CHECK(memcmp(in, yarn_c, sizeof in) == 0);
+    CHECK(af == 1.0f);
+    float t2[2] = {1.0f, 0.5f};
+    CHECK(tlm_yarn_transform(t2, 2, 2, 0.0, 4.0, 32.0, 1.0, 512, 1, &af) == TLM_EINVAL);  /* theta */
+    CHECK(tlm_yarn_transform(t2, 2, 2, 10000.0, 0.0, 32.0, 1.0, 512, 1, &af) == TLM_EINVAL); /* factor */
+    CHECK(tlm_yarn_transform(t2, 2, 2, 10000.0, 4.0, 1.0, 32.0, 512, 1, &af) == TLM_EINVAL); /* beta_fast < beta_slow */
+    CHECK(tlm_yarn_transform(t2, 2, 2, 10000.0, 4.0, 32.0, 1.0, 0, 1, &af) == TLM_EINVAL);  /* orig_len */
+    CHECK(tlm_yarn_transform(t2, 3, 2, 10000.0, 4.0, 32.0, 1.0, 512, 1, &af) == TLM_EINVAL); /* half mismatch */
+    tlm_log_level(TLM_LOG_WARN);
+}
+/* f32 model with YaRN vs the double reference (P-23): exercises the whole
+ * forward through the corrected frequencies and the attention scale. */
+static void check_yarn_reference(int scale, float factor, float bf, float bs, uint32_t orig) {
+    spec s;
+    memset(&s, 0, sizeof s);
+    s.L = 2; s.D = 256; s.H = 4; s.KV = 2; s.hd = 64; s.V = 50; s.E = 6; s.K = 2; s.de = 32;
+    s.ds = 48; s.router = 0; s.qk_norm = 1; s.n_drives = 2; s.routed_scale = 1.0f;
+    s.dense_dt = TLM_DT_F32;
+    s.expert_dt[0] = s.expert_dt[1] = s.expert_dt[2] = TLM_DT_F32;
+    s.seed = 400 + (unsigned)scale;
+    s.rope_scale = (uint32_t)scale; s.rope_factor = factor;
+    s.rope_beta_fast = bf; s.rope_beta_slow = bs; s.rope_orig_len = orig;
+    synth S;
+    char name[16];
+    snprintf(name, sizeof name, "yarn%d", scale);
+    CHECK_EQ_INT(build(&S, &s, name), 0);
+    rt r;
+    rt_cfg c = {2, 4, 1, 0.0, 0};
+    if (rt_open(&r, &S, &c)) { fprintf(stderr, "  open: %s\n", tlm_errmsg()); CHECK(0); synth_free(&S); return; }
+    tlm_kv *kv = tlm_kv_new(r.mdl, 32);
+    ref_state st = (ref_state){ .S = &S,
+                                .K = calloc((size_t)s.L * 256 * s.KV * s.hd, sizeof(double)),
+                                .Vc = calloc((size_t)s.L * 256 * s.KV * s.hd, sizeof(double)) };
+    float lg[64], lr[64];
+    const int toks[8] = {1, 7, 49, 0, 22, 7, 7, 3};
+    double worst = 0;
+    for (int i = 0; i < 8; i++) {
+        CHECK_EQ_INT(tlm_model_step(r.mdl, kv, toks[i], lg), 0);
+        ref_step(&st, toks[i], lr, NULL);
+        for (int t = 0; t < s.V; t++) {
+            double d = fabs((double)lg[t] - (double)lr[t]) / (1.0 + fabs((double)lr[t]));
+            if (d > worst) worst = d;
+        }
+    }
+    if (worst >= 1e-4) fprintf(stderr, "  yarn scale %d: worst relative logit error %g\n", scale, worst);
+    CHECK(worst < 1e-4);
+    free(st.K);
+    free(st.Vc);
+    tlm_kv_free(kv);
+    rt_close(&r);
+    synth_free(&S);
+}
+
+static void test_yarn_reference(void) {
+    /* hd=64, orig=512, factor=4: low=3, high=16 (truncate) so j>=8 extrapolates
+     * fully and the middle ramps; af = 1 + 0.1*ln 4. */
+    check_yarn_reference(1, 4.0f, 32.0f, 1.0f, 512);
+    /* no-truncate: fractional low/high, full extrapolation weight */
+    check_yarn_reference(2, 2.0f, 32.0f, 1.0f, 512);
+}
+
+/* thread / cache / prefetch / pin / tier configs must not change output bits;
+ * base is the 1-thread no-prefetch trace */
+static void inv_matrix(const synth *S, const spec *s, rt *r, const trace *base, int V) {
+    rt_cfg cfgs[] = {
+        {2, 64, 0, 0.0, 0},              /* threads */
+        {4, 64, 0, 0.0, 0},
+        {3, 64, 1, 0.5, 0},              /* resident + pinned + prefetch */
+        {1, (uint64_t)s->K, 0, 0.0, 0},  /* minimal cache: top_k slots, constant eviction */
+        {4, (uint64_t)s->K, 1, 0.0, 0},  /* minimal cache with prefetch (hints mostly dropped) */
+        {2, (uint64_t)s->K + 2, 1, 0.0, 6}, /* small cache, aggressive lookahead */
+        {2, 9, 1, 0.3, 0},               /* partial cache with pins */
+    };
+    for (size_t i = 0; i < sizeof cfgs / sizeof cfgs[0]; i++) {
+        trace t;
+        memset(&t, 0, sizeof t);
+        if (rt_open(r, S, &cfgs[i])) {
+            fprintf(stderr, "  cfg %zu open: %s\n", i, tlm_errmsg());
+            CHECK(0);
+            rt_close(r);
+            continue;
+        }
+        CHECK_EQ_INT(run_trace(r, V, &t), 0);
+        if (!same_trace(base, &t, V)) fprintf(stderr, "  cfg %zu differs\n", i);
+        CHECK(same_trace(base, &t, V));
+        tlm_store_stats ss;
+        tlm_store_get_stats(r->store, &ss);
+        if (cfgs[i].budget_slots == (uint64_t)s->K) CHECK(ss.evictions > 0 || ss.misses > (uint64_t)s->K * s->L);
+        CHECK_EQ_INT(ss.in_use, 0);   /* every acquire was released */
+        rt_close(r);
+        free(t.logits);
+    }
+
+    /* kernel tiers: every tier must reproduce the scalar bits (P-43) */
+    const char *tiers[] = {"scalar", "avx2", "avx512"};
+    for (int i = 0; i < 3; i++) {
+        tlm_cpu_force(tiers[i]);
+        tlm_quant_init();
+        if (strcmp(tlm_quant_tier(), tiers[i]) != 0) {
+            printf("  (tier %s not available here, got %s)\n", tiers[i], tlm_quant_tier());
+            continue;
+        }
+        trace t;
+        memset(&t, 0, sizeof t);
+        rt_cfg c = {2, 4, 1, 0.0, 0};
+        if (rt_open(r, S, &c)) { CHECK(0); rt_close(r); continue; }
+        CHECK_EQ_INT(run_trace(r, V, &t), 0);
+        if (!same_trace(base, &t, V)) fprintf(stderr, "  tier %s differs\n", tiers[i]);
+        CHECK(same_trace(base, &t, V));
+        rt_close(r);
+        free(t.logits);
+    }
+    tlm_cpu_force("auto");
+    tlm_quant_init();
+}
 static void test_invariance(void) {
     spec s = quant_spec();
     synth S;
@@ -530,56 +718,27 @@ static void test_invariance(void) {
     for (int i = 0; i < NSTEP * V; i++) n_finite += isfinite(base.logits[i]) != 0;
     CHECK_EQ_INT(n_finite, NSTEP * V);
 
-    const rt_cfg cfgs[] = {
-        {2, 64, 0, 0.0, 0},              /* threads */
-        {4, 64, 0, 0.0, 0},
-        {3, 64, 1, 0.5, 0},              /* resident + pinned + prefetch */
-        {1, (uint64_t)s.K, 0, 0.0, 0},   /* minimal cache: top_k slots, constant eviction */
-        {4, (uint64_t)s.K, 1, 0.0, 0},   /* minimal cache with prefetch (hints mostly dropped) */
-        {2, (uint64_t)s.K + 2, 1, 0.0, 6}, /* small cache, aggressive lookahead */
-        {2, 9, 1, 0.3, 0},               /* partial cache with pins */
-    };
-    for (size_t i = 0; i < sizeof cfgs / sizeof cfgs[0]; i++) {
-        trace t;
-        memset(&t, 0, sizeof t);
-        if (rt_open(&r, &S, &cfgs[i])) {
-            fprintf(stderr, "  cfg %zu open: %s\n", i, tlm_errmsg());
-            CHECK(0);
-            rt_close(&r);
-            continue;
-        }
-        CHECK_EQ_INT(run_trace(&r, V, &t), 0);
-        if (!same_trace(&base, &t, V)) fprintf(stderr, "  cfg %zu differs\n", i);
-        CHECK(same_trace(&base, &t, V));
-        tlm_store_stats ss;
-        tlm_store_get_stats(r.store, &ss);
-        if (cfgs[i].budget_slots == (uint64_t)s.K) CHECK(ss.evictions > 0 || ss.misses > (uint64_t)s.K * s.L);
-        CHECK_EQ_INT(ss.in_use, 0);   /* every acquire was released */
-        rt_close(&r);
-        free(t.logits);
-    }
+    inv_matrix(&S, &s, &r, &base, V);
 
-    /* kernel tiers: every tier must reproduce the scalar bits (P-43) */
-    const char *tiers[] = {"scalar", "avx2", "avx512"};
-    for (int i = 0; i < 3; i++) {
-        tlm_cpu_force(tiers[i]);
-        tlm_quant_init();
-        if (strcmp(tlm_quant_tier(), tiers[i]) != 0) {
-            printf("  (tier %s not available here, got %s)\n", tiers[i], tlm_quant_tier());
-            continue;
-        }
-        trace t;
-        memset(&t, 0, sizeof t);
-        rt_cfg c = {2, 4, 1, 0.0, 0};
-        if (rt_open(&r, &S, &c)) { CHECK(0); rt_close(&r); continue; }
-        CHECK_EQ_INT(run_trace(&r, V, &t), 0);
-        if (!same_trace(&base, &t, V)) fprintf(stderr, "  tier %s differs\n", tiers[i]);
-        CHECK(same_trace(&base, &t, V));
-        rt_close(&r);
-        free(t.logits);
+    /* YaRN variant (F-23): the same matrix must stay bit-identical */
+    s.rope_scale = 1; s.rope_factor = 4.0f; s.rope_beta_fast = 32.0f;
+    s.rope_beta_slow = 1.0f; s.rope_orig_len = 512; s.seed = 8;
+    synth Sy;
+    CHECK_EQ_INT(build(&Sy, &s, "invy"), 0);
+    trace by;
+    memset(&by, 0, sizeof by);
+    if (rt_open(&r, &Sy, &c0)) {
+        fprintf(stderr, "  yarn open: %s\n", tlm_errmsg());
+        CHECK(0);
+        synth_free(&S);
+        synth_free(&Sy);
+        return;
     }
-    tlm_cpu_force("auto");
-    tlm_quant_init();
+    CHECK_EQ_INT(run_trace(&r, V, &by), 0);
+    rt_close(&r);
+    inv_matrix(&Sy, &s, &r, &by, V);
+    free(by.logits);
+    synth_free(&Sy);
     free(base.logits);
     synth_free(&S);
 }
@@ -882,6 +1041,8 @@ int main(void) {
     CHECK_EQ_INT(tlm_mkdirs(g_root, 0700), 0);
     tlm_log_level(TLM_LOG_WARN);
     RUN(test_reference_f32);
+    RUN(test_yarn_table);
+    RUN(test_yarn_reference);
     RUN(test_invariance);
     RUN(test_prefill_equals_steps);
     RUN(test_hook_and_mask);
