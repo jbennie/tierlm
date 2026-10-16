@@ -5,6 +5,7 @@
 #   make URING=1            add the io_uring backend (needs liburing-devel)
 #   make test               build and run unit + end-to-end tests
 #   make asan / tsan        sanitizer builds of the test suite
+#   make oracle MODEL=DIR MANIFEST=S.tlmm TOKENS=1,2,3   P-121 teacher-forced oracle vs HF
 #   make clean
 #
 # BUILD=dir puts every object, library, binary and test under dir (default build/),
@@ -46,7 +47,7 @@ BINS     = $(addprefix $(BUILD)/bin/,$(BIN_NAMES))
 TEST_SRC = $(wildcard tests/test_*.c)
 TESTS    = $(patsubst tests/%.c,$(BUILD)/tests/%,$(TEST_SRC))
 
-.PHONY: all lib bins test asan tsan clean fmt-check
+.PHONY: all lib bins test oracle asan tsan clean fmt-check
 
 all: lib bins
 
@@ -81,6 +82,11 @@ test: $(TESTS) $(BINS)
 	@echo "== tests/setup.sh"; BUILD=$(BUILD) sh tests/setup.sh
 	@echo "== tests/e2e.sh"; BUILD=$(BUILD) sh tests/e2e.sh
 	@echo "ALL TESTS PASSED"
+
+# P-121 teacher-forced oracle vs the HF reference (needs the torch venv + model):
+#   make oracle MODEL=~/models/Qwen3-30B-A3B MANIFEST=path.tlmm TOKENS=1,2,3 [TOPK=10] [PY=PY]
+oracle:
+	@bash tools/oracle.sh "$(MODEL)" "$(MANIFEST)" "$(TOKENS)" "$(TOPK)" "$(PY)"
 
 asan:
 	$(MAKE) BUILD=build-asan OPTFLAGS="-O1 -fsanitize=address,undefined -fno-omit-frame-pointer" \

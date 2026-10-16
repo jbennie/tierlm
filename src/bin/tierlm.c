@@ -471,6 +471,58 @@ static int cmd_run(int argc, char **argv) {
     tlm_cfg_free(o.cfg);
     return 0;
 }
+/* ---- oracle: teacher-forced per-position top-k dump (P-121) --------------- */
+/* Fill ids/sc (descending: sc[0] is the argmax) with the top-k (id, score) of lg[0..V). */
+static void topk_of(const float *lg, int V, int k, int *ids, float *sc) {
+    if (k > V) k = V;
+    for (int j = 0; j < k; j++) { sc[j] = -INFINITY; ids[j] = 0; }
+    for (int v = 0; v < V; v++) {
+        float s = lg[v];
+        int j = 0;
+        while (j < k && s <= sc[j]) j++;
+        if (j == k) continue;
+        for (int m = k - 1; m > j; m--) { sc[m] = sc[m - 1]; ids[m] = ids[m - 1]; }
+        sc[j] = s; ids[j] = v;
+    }
+}
+
+/* tierlm oracle: feed a fixed id sequence through the runtime one token at a
+ * time and, per position, dump the vocab top-k to stdout. Position i is the
+ * distribution over the token following t0..ti, the same index as transformers'
+ * logits[i]. Argmax and the top-k id set are invariant to the raw-vs-logprob
+ * scale, so this lines up with a HF reference run on the identical ids.
+ * Emits one JSON object per line: {"pos": i, "topk": [[id, score], ...]}. */
+static int cmd_oracle(int argc, char **argv) {
+    opts o;
+    parse_opts(&o, argc, argv, 0);
+    if (!o.tokens) die("oracle: --tokens <id,id,...> is required (the fixed teacher-forced sequence)");
+    enum { TOPK = 10 };
+    runtime r;
+    rt_open(&r, &o);
+    const tlm_model_geom *g = tlm_model_geom_of(r.mdl);
+    int np = 0;
+    int *seq = make_prompt(&o, (int)g->vocab, NULL, &np);
+    if (np < 2) die("oracle: need at least 2 ids to get per-position distributions");
+    tlm_kv *kv = tlm_kv_new(r.mdl, np + 1);
+    if (!kv) die("%s", tlm_errmsg());
+    float *lg = (float *)malloc(sizeof(float) * (size_t)g->vocab);
+    int *ids = (int *)malloc(sizeof(int) * TOPK);
+    float *sc = (float *)malloc(sizeof(float) * TOPK);
+    if (!lg || !ids || !sc) die("out of memory");
+    for (int i = 0; i < np; i++) {
+        if (tlm_model_step(r.mdl, kv, seq[i], lg)) die("%s", tlm_errmsg());
+        topk_of(lg, (int)g->vocab, TOPK, ids, sc);
+        int k = TOPK < (int)g->vocab ? TOPK : (int)g->vocab;
+        fprintf(stdout, "{\"pos\": %d, \"topk\": [", i);
+        for (int j = 0; j < k; j++) fprintf(stdout, "%s[%d, %.9g]", j ? ", " : "", ids[j], sc[j]);
+        fprintf(stdout, "]}\n");
+    }
+    free(ids); free(sc); free(lg); free(seq);
+    tlm_kv_free(kv);
+    rt_close(&r, &o);
+    tlm_cfg_free(o.cfg);
+    return 0;
+}
 
 static int cmd_bench(int argc, char **argv) {
     opts o;
@@ -573,6 +625,7 @@ static void usage(FILE *f) {
             "               [--direct yes|no] [--prefetch router|off] [--pin-frac F] [--warm FILE]\n"
             "               [--kernel scalar|avx2|avx512] [--stats] [--etc DIR] [--print-tokens]\n"
             "  tierlm bench MANIFEST [--prompt-len N] [-n N] [runtime flags as for run]\n"
+            "  tierlm oracle MANIFEST --tokens 1,2,3   (per-position top-k dump, P-121)\n"
             "  tierlm config show [--origin] [--etc DIR]\n"
             "  tierlm config check [--etc DIR]\n",
             TIERLM_VERSION);
@@ -587,6 +640,7 @@ int main(int argc, char **argv) {
     }
     if (!strcmp(argv[1], "run")) return cmd_run(argc, argv);
     if (!strcmp(argv[1], "bench")) return cmd_bench(argc, argv);
+    if (!strcmp(argv[1], "oracle")) return cmd_oracle(argc, argv);
     if (!strcmp(argv[1], "config")) return cmd_config(argc, argv);
     usage(stderr);
     return 2;

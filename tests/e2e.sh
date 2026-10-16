@@ -58,6 +58,12 @@ run_logged "$T/tok.out" "$B/tierlm" run "$T/models/exact.tlmm" --tokens 72,101,1
 [ "$(wc -w < "$T/tok.out")" -eq 4 ] || fail "--tokens run"
 run_logged "$T/bench.out" "$B/tierlm" bench "$T/models/exact.tlmm" --prompt-len 16 -n 16
 grep -q "tok/s" "$T/bench.out" || fail "bench"
+step "oracle: per-position teacher-forced top-k dump (P-121)"
+run_logged "$T/oracle.out" "$B/tierlm" oracle "$T/models/exact.tlmm" --tokens 1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16
+[ "$(grep -c '^{"pos"' "$T/oracle.out")" -eq 16 ] || fail "oracle emitted $(grep -c '^{"pos"' "$T/oracle.out") positions, want 16"
+[ "$(grep -c '"topk": \[' "$T/oracle.out")" -eq 16 ] || fail "oracle lines lack a topk array"
+grep -q '"pos": 0' "$T/oracle.out" || fail "oracle missing pos 0"
+grep -q '"pos": 15' "$T/oracle.out" || fail "oracle missing pos 15 (last)"
 
 step "recompile (exact): passes 2 and 3 resume from the work dir"
 run_logged "$T/exact2.log" "$B/tlmc" compile "$T/src" --out "$T/models/exact.tlmm" --drives "$D3" --profile exact
