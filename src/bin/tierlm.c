@@ -18,6 +18,7 @@
  * packet on it has a replica, so reads fall back to the other copy (P-31).
  * Prompts are byte-level for synthetic models: token = byte mod vocab.
  */
+#include "tlm_bpe.h"
 #include "tlm_cfg.h"
 #include "tlm_io.h"
 #include "tlm_model.h"
@@ -80,7 +81,7 @@ static void fmt_bytes(uint64_t b, char *out, size_t cap) {
 
 /* ---- options shared by run and bench ------------------------------------- */
 typedef struct {
-    const char *manifest, *prompt, *tokens, *etc, *warm, *kernel;
+    const char *manifest, *prompt, *tokens, *etc, *warm, *kernel, *tokenizer;
     int         n, stats, print_tokens, prompt_len;
     int         have_temp, have_seed;
     double      temp, top_p, min_p;
@@ -129,6 +130,7 @@ static void parse_opts(opts *o, int argc, char **argv, int bench) {
         if (!strcmp(a, "--etc")) { i++; continue; }
         if (!strcmp(a, "--prompt")) o->prompt = need(argc, argv, &i);
         else if (!strcmp(a, "--tokens")) o->tokens = need(argc, argv, &i);
+        else if (!strcmp(a, "--tokenizer")) o->tokenizer = need(argc, argv, &i);
         else if (!strcmp(a, "-n") || !strcmp(a, "--max-tokens")) o->n = (int)num_arg(need(argc, argv, &i), a, 0, 1 << 24);
         else if (!strcmp(a, "--temp")) { o->temp = frac_arg(need(argc, argv, &i), a, 0, 100); o->have_temp = 1; }
         else if (!strcmp(a, "--top-p")) o->top_p = frac_arg(need(argc, argv, &i), a, 0, 1);
@@ -340,7 +342,7 @@ static void print_stats(runtime *r, FILE *f, int n_prompt, int n_gen, double pre
 }
 
 /* ---- prompt ------------------------------------------------------------------- */
-static int *make_prompt(const opts *o, int V, int *n) {
+static int *make_prompt(const opts *o, int V, const tlm_bpe *tok, int *n) {
     if (o->tokens) {
         int cap = 16, k = 0;
         int *t = (int *)malloc(sizeof(int) * (size_t)cap);
@@ -363,6 +365,23 @@ static int *make_prompt(const opts *o, int V, int *n) {
     const char *p = o->prompt ? o->prompt : "Hello";
     size_t L = strlen(p);
     if (!L) die("--prompt: empty");
+    if (tok) {
+        /* real tokenizer: bare BPE encode, added tokens off (P-99) */
+        int cap = (int)(L * 4) + 16, k;
+        int *t = (int *)malloc(sizeof(int) * (size_t)cap);
+        if (!t) die("out of memory");
+        for (;;) {
+            k = tlm_bpe_encode(tok, p, L, 0, t, cap);
+            if (k >= 0) break;
+            cap *= 2;
+            int *nt = (int *)realloc(t, sizeof(int) * (size_t)cap);
+            if (!nt) die("out of memory");
+            t = nt;
+        }
+        if (!k) die("--prompt encodes to zero tokens");
+        *n = k;
+        return t;
+    }
     int *t = (int *)malloc(sizeof(int) * L);
     if (!t) die("out of memory");
     for (size_t i = 0; i < L; i++) t[i] = (unsigned char)p[i] % V;   /* byte-level, mod vocab */
@@ -370,13 +389,28 @@ static int *make_prompt(const opts *o, int V, int *n) {
     return t;
 }
 
-typedef struct { int print_tokens, count; } emit_ctx;
+typedef struct { int print_tokens, count; tlm_bpe_dec *dec; } emit_ctx;
 static int emit(void *ctx, int token) {
     emit_ctx *e = (emit_ctx *)ctx;
-    if (e->print_tokens) printf("%s%d", e->count ? " " : "", token);
-    else if (token >= 32 && token < 127) putchar(token);
-    else if (token == '\n' || token == '\t') putchar(token);
-    else printf("<%d>", token);
+    if (e->print_tokens) {
+        printf("%s%d", e->count ? " " : "", token);
+    } else if (e->dec) {
+        char buf[256];
+        int k;
+        for (;;) {
+            k = tlm_bpe_dec_push(e->dec, token, buf, sizeof buf);
+            if (k >= 0) break;
+            fprintf(stderr, "emit: decode overflow\n");
+            break;
+        }
+        if (k > 0) fwrite(buf, 1, (size_t)k, stdout);
+    } else if (token >= 32 && token < 127) {
+        putchar(token);
+    } else if (token == '\n' || token == '\t') {
+        putchar(token);
+    } else {
+        printf("<%d>", token);
+    }
     e->count++;
     fflush(stdout);
     return 0;
@@ -385,18 +419,25 @@ static int emit(void *ctx, int token) {
 static int cmd_run(int argc, char **argv) {
     opts o;
     parse_opts(&o, argc, argv, 0);
+    tlm_bpe *tbpe = NULL;
+    if (o.tokenizer) {
+        char err[512] = "";
+        tbpe = tlm_bpe_load(o.tokenizer, err, sizeof err);
+        if (!tbpe) die("--tokenizer: %s", err);
+    }
     runtime r;
     rt_open(&r, &o);
     const tlm_model_geom *g = tlm_model_geom_of(r.mdl);
     int np = 0;
-    int *prompt = make_prompt(&o, (int)g->vocab, &np);
+    int *prompt = make_prompt(&o, (int)g->vocab, tbpe, &np);
     int ctx = np + o.n + 1;
     if (g->max_ctx && ctx > (int)g->max_ctx) ctx = (int)g->max_ctx;
     if (np >= ctx) die("prompt of %d tokens does not fit the context (%u)", np, g->max_ctx);
     tlm_kv *kv = tlm_kv_new(r.mdl, ctx);
     if (!kv) die("%s", tlm_errmsg());
     tlm_sampler s = {(float)o.temp, (float)o.top_p, (float)o.min_p, o.have_seed ? o.seed : 0};
-    emit_ctx ec = {o.print_tokens, 0};
+    tlm_bpe_dec *dec = tbpe && !o.print_tokens ? tlm_bpe_dec_new(tbpe, 1) : NULL;
+    emit_ctx ec = {o.print_tokens, 0, dec};
     /* prefill and decode timed separately for --stats */
     float *lg = (float *)malloc(sizeof(float) * g->vocab);
     if (!lg) die("out of memory");
@@ -413,12 +454,19 @@ static int cmd_run(int argc, char **argv) {
         if (tlm_model_step(r.mdl, kv, tok, lg)) die("%s", tlm_errmsg());
     }
     uint64_t t2 = tlm_now_ns();
+    if (dec) {
+        char tail[256];
+        int k = tlm_bpe_dec_flush(dec, tail, sizeof tail);
+        if (k > 0) fwrite(tail, 1, (size_t)k, stdout);
+    }
     putchar('\n');
     fflush(stdout);
     if (o.stats) print_stats(&r, stderr, np, gen, (double)(t1 - t0) * 1e-9, (double)(t2 - t1) * 1e-9);
     free(lg);
     free(prompt);
     tlm_kv_free(kv);
+    tlm_bpe_dec_free(dec);
+    tlm_bpe_free(tbpe);
     rt_close(&r, &o);
     tlm_cfg_free(o.cfg);
     return 0;

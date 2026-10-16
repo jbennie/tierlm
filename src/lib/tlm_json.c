@@ -519,6 +519,12 @@ const tlm_jval *tlm_jat(const tlm_jval *v, size_t i) {
     return NULL;
 }
 
+/* The object key at index i (objects only; NULL for arrays/out of range). */
+const char *tlm_jkey(const tlm_jval *obj, size_t i) {
+    if (!obj || obj->type != TLM_J_OBJ || i >= obj->u.obj.n) return NULL;
+    return obj->u.obj.keys[i];
+}
+
 const char *tlm_jtype_name(tlm_jtype t) {
     switch (t) {
     case TLM_J_NULL: return "null";

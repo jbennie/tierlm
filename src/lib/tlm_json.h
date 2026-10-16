@@ -40,6 +40,8 @@ int64_t         tlm_jint(const tlm_jval *v, int64_t dflt);
 int             tlm_jbool(const tlm_jval *v, int dflt);
 size_t          tlm_jlen(const tlm_jval *v);              /* array/object length */
 const tlm_jval *tlm_jat(const tlm_jval *arr, size_t i);
+/* The object key at index i (objects only; NULL for arrays/out of range). */
+const char     *tlm_jkey(const tlm_jval *obj, size_t i);
 
 /* Minimal streaming writer. */
 typedef struct { FILE *f; int depth; int need_comma[64]; } tlm_jw;
