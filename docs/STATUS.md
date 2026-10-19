@@ -1,6 +1,6 @@
 # Status
 
-Last updated 2026-10-02. This page is the hand-over point: read it before picking up work.
+Last updated 2026-10-19. This page is the hand-over point: read it before picking up work.
 
 ## What exists and is tested
 
@@ -17,10 +17,10 @@ clean tree. The code is about 16k lines of C in `src/`, plus 6k lines of tests.
 | Async I/O: persistent pread pool per drive, optional io_uring, O_DIRECT switch, replica reads (shorter queue wins, fall back on error) | done | `test_io` |
 | Expert store: fixed slot arena, reserve → loading → ready → released, global LFU with decay, pins, warm sidecar, prefetch that never displaces demand | done | `test_store`, the e2e tiny-vs-large cache check |
 | Worker pool: chunk claiming, deterministic split, L3-grouped pinning | done | `test_pool` |
-| safetensors reader (single and sharded) and writer | done | `test_st` |
+| safetensors reader (single and sharded) and writer (F32/F16/BF16/F8_E4M3 raw tensors); `tlm_st_read_fp8_block` decodes E4M3 weights with their `<name>_scale_inv` 128×128 F32 block-scale grid | done | `test_st` (writer round-trips, block-scale decode incl. partial blocks; refused: missing/non-F32/misshaped scales, 1-D FP8, E4M3 NaN codes) |
 | MoE decoder: RMSNorm, GQA with qk-norm, RoPE (NeoX), softmax and sigmoid+bias routers, SwiGLU experts + shared expert, fixed combine order, KV cache, sampler, router-lookahead prefetch, expert mask | done | `test_model` (invariance across threads, cache sizes, kernels) |
 | Decision engine: Choice / Score / Noul questions, rules backend, SELF callback, confidence policy, JSONL audit log | done (rules) | `test_decide` |
-| `tlmc`: synth, compile passes 1–9 (exact / balanced / aggressive), resume, REAP pruning with an eval gate, Q5_K demotion, heat-balanced placement with pins and replicas, report, atlas | done for Qwen3-MoE-like checkpoints | `tests/e2e.sh` |
+| `tlmc`: synth (incl. `--fp8` block-scale checkpoints), compile passes 1–9 (exact / balanced / aggressive) over BF16/F16/F32 and FP8 E4M3 + 128×128 block-scale checkpoints, resume, REAP pruning with an eval gate, Q5_K demotion, heat-balanced placement with pins and replicas, report, atlas | done for Qwen3-MoE-like checkpoints | `tests/e2e.sh` (incl. the `synth --fp8` compile + run step) |
 | `tierlm`: run, bench, config show/check, missing-drive fallback to replicas | done | `tests/e2e.sh` |
 
 Kernel throughput measured in the build container (single thread, AVX-512, -O2) was 20.4 GB/s for
@@ -36,10 +36,10 @@ These are the gaps that stop tierlm from running a real model today.
    use `tierlm run --tokens 1,2,3` with ids from an external tokenizer, but `tlmc --corpus` needs
    the real tokenizer before its calibration statistics mean anything. This needs BPE plus the
    chat template, with the parity gates of P-127.
-2. **Narrow ingest.** `tlmc compile` takes BF16/F16/F32 safetensors for Qwen3-MoE / Qwen2-MoE style
-   decoders: every layer MoE, no attention biases, plain RoPE (`rope_scaling` is ignored with a
-   warning). It refuses the following:
-   - FP8 checkpoints (block-scale ingest not wired)
+2. **Narrow ingest.** `tlmc compile` takes BF16/F16/F32 safetensors, and FP8 E4M3 safetensors with
+   f32 128×128 block scales, for Qwen3-MoE / Qwen2-MoE style decoders: every layer MoE, no
+   attention biases, plain RoPE (`rope_scaling` is ignored with a warning). It refuses the following:
+   - FP8 checkpoints with single-byte UE8M0 block scales (DeepSeek-V4 class)
    - dense-FFN prefix layers (`first_k_dense_replace`, `mlp_only_layers`)
    - MLA attention (DeepSeek V3/V4), GGUF input, and native MXFP4 experts
 3. **No MTP speculation.** `spec.mode = mtp` is accepted by the config schema, but the runtime warns
@@ -83,6 +83,11 @@ These are the gaps that stop tierlm from running a real model today.
 
 The order follows `research/01-review-and-plan.md` as amended by `research/03-two-stage-design.md`.
 Each milestone ends on a gate.
+
+**M1 progress (2026-10-19):** BPE tokenizer + chat template (P-127), YaRN RoPE and the
+teacher-forced oracle (P-121) are done in sibling slices (`tierlm-tok`, `tierlm-yarn`,
+`tierlm-oracle`) awaiting integration; this slice adds FP8 block-scale ingest. Not started:
+dense-prefix layers. The gate run on Qwen3-30B-A3B needs a GPU/HF box.
 
 | # | Milestone | Main work | Gate |
 | --- | --- | --- | --- |

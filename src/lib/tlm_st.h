@@ -35,14 +35,23 @@ const tlm_st_tensor *tlm_st_at(const tlm_st *st, int i);
 const tlm_st_tensor *tlm_st_find(const tlm_st *st, const char *name);
 /* Read a tensor converted to f32 (F32/F16/BF16 sources). dst holds numel floats. */
 int     tlm_st_read_f32(tlm_st *st, const tlm_st_tensor *t, float *dst);
+/* Read an FP8 (E4M3) 2-D tensor decoded with its `<name>_scale_inv`
+ * 128x128 block-scale tensor (F32 grid; see tlm_st.c notes). dst must
+ * hold rows x cols floats. 1-D FP8, missing/non-F32/misshaped scales and
+ * E4M3 NaN codes are refused. */
+int     tlm_st_read_fp8_block(tlm_st *st, const tlm_st_tensor *t, float *dst);
 /* Read raw bytes. */
 int     tlm_st_read_raw(tlm_st *st, const tlm_st_tensor *t, void *dst);
 int64_t tlm_st_numel(const tlm_st_tensor *t);
 
-/* Writer: collects tensors (F32 only) and writes one .safetensors file. */
+/* Writer: collects tensors and writes one .safetensors file. add() is F32;
+ * add_raw() accepts F32/F16/BF16/F8_E4M3 with raw bytes (nbytes must equal
+ * numel x element size; dtype must outlive the writer). */
 typedef struct tlm_st_writer tlm_st_writer;
 tlm_st_writer *tlm_st_writer_new(void);
 int  tlm_st_writer_add(tlm_st_writer *w, const char *name, const float *data, int ndim, const int64_t *shape);
+int  tlm_st_writer_add_raw(tlm_st_writer *w, const char *name, const char *dtype, const void *data,
+                           uint64_t nbytes, int ndim, const int64_t *shape);
 int  tlm_st_writer_save(tlm_st_writer *w, const char *path);
 void tlm_st_writer_free(tlm_st_writer *w);
 
@@ -53,13 +62,17 @@ void tlm_st_writer_free(tlm_st_writer *w);
  * size; non-empty tensors may not overlap; rank <= 4; names < 160 bytes.
  * Tensors of other dtypes (I64, F64, ...) are skipped with a warning.
  * F8_E4M3 tensors have is_fp8 = 1 and dtype TLM_DT_FP8E4M3_B128; their
- * tlm_st_read_f32 decodes raw e4m3 values WITHOUT block scales (apply the
- * companion scale tensor yourself). Sharded: the index's weight_map decides
- * which shard owns a name present in two shards; every listed name must exist.
+ * tlm_st_read_f32 decodes raw e4m3 values WITHOUT block scales. Use
+ * tlm_st_read_fp8_block for 2-D weights: it decodes with the F32
+ * `<name>_scale_inv` 128x128 block grid and refuses 1-D FP8, missing or
+ * misshaped scales and E4M3 NaN codes. Sharded: the index's weight_map
+ * decides which shard owns a name present in two shards; every listed name
+ * must exist.
  * Writer: tensors are written in insertion order, the header is padded with
  * spaces so the data buffer starts 8-byte aligned, the file is fsynced and
  * renamed into place (P-08). Names may not contain '"', '\\' or control
- * characters, nor be "__metadata__".
+ * characters, nor be "__metadata__". add() writes F32; add_raw() writes
+ * F32/F16/BF16/F8_E4M3 raw bytes, checked against numel x element size.
  */
 
 #ifdef __cplusplus

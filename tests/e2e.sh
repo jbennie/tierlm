@@ -65,6 +65,18 @@ run_logged "$T/oracle.out" "$B/tierlm" oracle "$T/models/exact.tlmm" --tokens 1,
 grep -q '"pos": 0' "$T/oracle.out" || fail "oracle missing pos 0"
 grep -q '"pos": 15' "$T/oracle.out" || fail "oracle missing pos 15 (last)"
 
+step "synth --fp8: block-scale FP8 checkpoint (d_expert 320 = partial 128 block), compile + run"
+run_logged "$T/fp8s.log" "$B/tlmc" synth --out "$T/src-fp8" --layers 2 --experts 8 --top-k 2 --shared 1 --d-expert 320 --seed 3 --fp8
+grep -q "FP8 E4M3 with 128x128 block scales" "$T/fp8s.log" || fail "synth --fp8 flag ignored"
+run_logged "$T/fp8c.log" "$B/tlmc" compile "$T/src-fp8" --out "$T/models/fp8.tlmm" --drives "$D3" --profile exact
+grep -q "bit-identical logits yes, greedy free run identical yes" "$T/fp8c.log" || fail "fp8 store not internally consistent"
+run_logged "$T/fp8t.out" "$B/tierlm" run "$T/models/fp8.tlmm" --prompt "$P" -n 16 --cache 1 --print-tokens
+run_logged "$T/fp8l.out" "$B/tierlm" run "$T/models/fp8.tlmm" --prompt "$P" -n 16 --print-tokens
+grep -v -e '^--' -e '^[a-z]' -e '^  drive' -e 'tierlm warn' "$T/fp8t.out" > "$T/fp8t.tok"
+cp "$T/fp8l.out" "$T/fp8l.tok"
+[ "$(wc -w < "$T/fp8l.tok")" -eq 16 ] || fail "expected 16 tokens from the fp8 store"
+cmp -s "$T/fp8t.tok" "$T/fp8l.tok" || { cat "$T/fp8t.tok" "$T/fp8l.tok" >&2; fail "fp8 store: tiny and large cache differ"; }
+
 step "recompile (exact): passes 2 and 3 resume from the work dir"
 run_logged "$T/exact2.log" "$B/tlmc" compile "$T/src" --out "$T/models/exact.tlmm" --drives "$D3" --profile exact
 grep -q "reference store .*\[reused\]" "$T/exact2.log" || fail "pass 2 not reused"

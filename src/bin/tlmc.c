@@ -2,7 +2,8 @@
  *
  *   tlmc synth   --out DIR [--layers N --d-model N --heads N --kv-heads N
  *                --head-dim N --experts N --top-k N --d-expert N --shared N
- *                --vocab N --seed N --router softmax|sigmoid --qk-norm yes|no]
+ *                --vocab N --seed N --router softmax|sigmoid --qk-norm yes|no
+ *                [--fp8]
  *   tlmc compile SRC --out MANIFEST --drives d1,d2,... [--experts q6_k]
  *                [--dense q8_0] [--profile exact|balanced|aggressive]
  *                [--replicas auto|none] [--corpus FILE] [--eval FILE]
@@ -221,15 +222,53 @@ static float *randn(rng_t *r, size_t n, float sd, float mean) {
     return p;
 }
 
-static void st_put(tlm_st_writer *w, const char *name, float *data, int ndim, int64_t a, int64_t b) {
-    int64_t sh[2] = {a, b};
-    if (tlm_st_writer_add(w, name, data, ndim, sh)) die("%s", tlm_errmsg());
+/* Encode a 2-D weight as E4M3 with per-128x128-block F32 scales
+ * (scale = amax / 448, so the largest magnitude hits the E4M3 range) and
+ * write the weight plus its `<name>_scale_inv` grid. */
+static void st_put_fp8(tlm_st_writer *w, const char *name, const float *x, int64_t rows, int64_t cols) {
+    int64_t krb = (rows + 127) / 128, nkb = (cols + 127) / 128;
+    float *sc = (float *)malloc(sizeof(float) * (size_t)krb * nkb);
+    if (!sc) die("out of memory");
+    for (int64_t b = 0; b < krb * nkb; b++) {
+        int64_t r0 = (b / nkb) * 128, c0 = (b % nkb) * 128;
+        int64_t r1 = r0 + 128 < rows ? r0 + 128 : rows;
+        int64_t c1 = c0 + 128 < cols ? c0 + 128 : cols;
+        float amax = 0;
+        for (int64_t rr = r0; rr < r1; rr++)
+            for (int64_t cc = c0; cc < c1; cc++) {
+                float a = fabsf(x[rr * cols + cc]);
+                if (a > amax) amax = a;
+            }
+        sc[b] = amax > 0 ? amax / 448.0f : 1.0f;
+    }
+    uint8_t *codes = (uint8_t *)malloc((size_t)rows * cols);
+    if (!codes) die("out of memory");
+    for (int64_t rr = 0; rr < rows; rr++)
+        for (int64_t cc = 0; cc < cols; cc++)
+            codes[rr * cols + cc] = tlm_f32_to_e4m3(x[rr * cols + cc] / sc[(rr / 128) * nkb + cc / 128]);
+    int64_t shw[2] = {rows, cols};
+    if (tlm_st_writer_add_raw(w, name, "F8_E4M3", codes, (uint64_t)rows * (uint64_t)cols, 2, shw)) die("%s", tlm_errmsg());
+    free(codes);
+    char snm[200];
+    snprintf(snm, sizeof snm, "%s_scale_inv", name);
+    int64_t shs[2] = {krb, nkb};
+    if (tlm_st_writer_add(w, snm, sc, 2, shs)) die("%s", tlm_errmsg());
+    free(sc);
+}
+
+static void st_put(tlm_st_writer *w, const char *name, float *data, int ndim, int64_t a, int64_t b, int fp8) {
+    if (fp8 && ndim == 2) {
+        st_put_fp8(w, name, data, a, b);
+    } else {
+        int64_t sh[2] = {a, b};
+        if (tlm_st_writer_add(w, name, data, ndim, sh)) die("%s", tlm_errmsg());
+    }
     free(data);
 }
 
 static int cmd_synth(int argc, char **argv) {
     long L = 4, D = 256, H = 4, KV = 2, hd = 64, E = 16, K = 2, de = 256, shared = 1, V = 512;
-    long seed = 1, qk = 1, router = 0;
+    long seed = 1, qk = 1, router = 0, fp8 = 0;
     const char *out = NULL;
     for (int i = 2; i < argc; i++) {
         const char *a = argv[i];
@@ -255,7 +294,8 @@ static int cmd_synth(int argc, char **argv) {
             int b;
             if (tlm_cfg_parse_bool(v, &b)) die("--qk-norm: yes or no");
             qk = b;
-        } else die("synth: unknown option %s", a);
+        } else if (!strcmp(a, "--fp8")) fp8 = 1;
+        else die("synth: unknown option %s", a);
     }
     if (!out) die("synth: --out DIR is required");
     if (H % KV) die("synth: --heads must be a multiple of --kv-heads");
@@ -281,21 +321,21 @@ static int cmd_synth(int argc, char **argv) {
     float *emb = randn(&r, (size_t)V * D, 1.0f, 0.0f);
     for (long t = 0; t < V; t++)
         for (long i = 0; i < D; i++) emb[t * D + i] += sqrtf((float)D) * u[i];
-    st_put(w, "model.embed_tokens.weight", emb, 2, V, D);
+    st_put(w, "model.embed_tokens.weight", emb, 2, V, D, fp8);
     long S = shared * de;
     for (long l = 0; l < L; l++) {
 #define NM(fmt) (snprintf(nm, sizeof nm, "model.layers.%ld." fmt, l), nm)
-        st_put(w, NM("input_layernorm.weight"), randn(&r, (size_t)D, 0.1f, 1.0f), 1, D, 0);
-        st_put(w, NM("self_attn.q_proj.weight"), randn(&r, (size_t)H * hd * D, sd_in, 0), 2, H * hd, D);
-        st_put(w, NM("self_attn.k_proj.weight"), randn(&r, (size_t)KV * hd * D, sd_in, 0), 2, KV * hd, D);
-        st_put(w, NM("self_attn.v_proj.weight"), randn(&r, (size_t)KV * hd * D, sd_in, 0), 2, KV * hd, D);
+        st_put(w, NM("input_layernorm.weight"), randn(&r, (size_t)D, 0.1f, 1.0f), 1, D, 0, fp8);
+        st_put(w, NM("self_attn.q_proj.weight"), randn(&r, (size_t)H * hd * D, sd_in, 0), 2, H * hd, D, fp8);
+        st_put(w, NM("self_attn.k_proj.weight"), randn(&r, (size_t)KV * hd * D, sd_in, 0), 2, KV * hd, D, fp8);
+        st_put(w, NM("self_attn.v_proj.weight"), randn(&r, (size_t)KV * hd * D, sd_in, 0), 2, KV * hd, D, fp8);
         st_put(w, NM("self_attn.o_proj.weight"), randn(&r, (size_t)D * H * hd, 0.5f / sqrtf((float)(H * hd)), 0),
-               2, D, H * hd);
+               2, D, H * hd, fp8);
         if (qk) {
-            st_put(w, NM("self_attn.q_norm.weight"), randn(&r, (size_t)hd, 0.1f, 1.0f), 1, hd, 0);
-            st_put(w, NM("self_attn.k_norm.weight"), randn(&r, (size_t)hd, 0.1f, 1.0f), 1, hd, 0);
+            st_put(w, NM("self_attn.q_norm.weight"), randn(&r, (size_t)hd, 0.1f, 1.0f), 1, hd, 0, fp8);
+            st_put(w, NM("self_attn.k_norm.weight"), randn(&r, (size_t)hd, 0.1f, 1.0f), 1, hd, 0, fp8);
         }
-        st_put(w, NM("post_attention_layernorm.weight"), randn(&r, (size_t)D, 0.1f, 1.0f), 1, D, 0);
+        st_put(w, NM("post_attention_layernorm.weight"), randn(&r, (size_t)D, 0.1f, 1.0f), 1, D, 0, fp8);
         int *perm = (int *)malloc(sizeof(int) * (size_t)E);
         for (long e = 0; e < E; e++) perm[e] = (int)e;
         for (long e = E - 1; e > 0; e--) {
@@ -312,27 +352,28 @@ static int cmd_synth(int argc, char **argv) {
             for (long i = 0; i < D; i++) gate[e * D + i] += 1.6f / sqrtf((float)D) * a * u[i];
         }
         free(perm);
-        st_put(w, NM("mlp.gate.weight"), gate, 2, E, D);
-        if (router == 2) st_put(w, NM("mlp.gate.e_score_correction_bias"), randn(&r, (size_t)E, 0.05f, 0), 1, E, 0);
+        st_put(w, NM("mlp.gate.weight"), gate, 2, E, D, fp8);
+        if (router == 2)
+            st_put(w, NM("mlp.gate.e_score_correction_bias"), randn(&r, (size_t)E, 0.05f, 0), 1, E, 0, fp8);
         for (long e = 0; e < E; e++) {
             char en[200];
             snprintf(en, sizeof en, "model.layers.%ld.mlp.experts.%ld.gate_proj.weight", l, e);
-            st_put(w, en, randn(&r, (size_t)de * D, sd_in, 0), 2, de, D);
+            st_put(w, en, randn(&r, (size_t)de * D, sd_in, 0), 2, de, D, fp8);
             snprintf(en, sizeof en, "model.layers.%ld.mlp.experts.%ld.up_proj.weight", l, e);
-            st_put(w, en, randn(&r, (size_t)de * D, sd_in, 0), 2, de, D);
+            st_put(w, en, randn(&r, (size_t)de * D, sd_in, 0), 2, de, D, fp8);
             snprintf(en, sizeof en, "model.layers.%ld.mlp.experts.%ld.down_proj.weight", l, e);
-            st_put(w, en, randn(&r, (size_t)D * de, 0.5f / sqrtf((float)de), 0), 2, D, de);
+            st_put(w, en, randn(&r, (size_t)D * de, 0.5f / sqrtf((float)de), 0), 2, D, de, fp8);
         }
         if (S > 0) {
-            st_put(w, NM("mlp.shared_expert.gate_proj.weight"), randn(&r, (size_t)S * D, sd_in, 0), 2, S, D);
-            st_put(w, NM("mlp.shared_expert.up_proj.weight"), randn(&r, (size_t)S * D, sd_in, 0), 2, S, D);
+            st_put(w, NM("mlp.shared_expert.gate_proj.weight"), randn(&r, (size_t)S * D, sd_in, 0), 2, S, D, fp8);
+            st_put(w, NM("mlp.shared_expert.up_proj.weight"), randn(&r, (size_t)S * D, sd_in, 0), 2, S, D, fp8);
             st_put(w, NM("mlp.shared_expert.down_proj.weight"), randn(&r, (size_t)D * S, 0.5f / sqrtf((float)S), 0),
-                   2, D, S);
+                   2, D, S, fp8);
         }
 #undef NM
     }
-    st_put(w, "model.norm.weight", randn(&r, (size_t)D, 0.1f, 1.0f), 1, D, 0);
-    st_put(w, "lm_head.weight", randn(&r, (size_t)V * D, 3.0f * sd_in, 0), 2, V, D);
+    st_put(w, "model.norm.weight", randn(&r, (size_t)D, 0.1f, 1.0f), 1, D, 0, fp8);
+    st_put(w, "lm_head.weight", randn(&r, (size_t)V * D, 3.0f * sd_in, 0), 2, V, D, fp8);
     free(u);
     char path[1200];
     snprintf(path, sizeof path, "%s/model.safetensors", out);
@@ -351,13 +392,16 @@ static int cmd_synth(int argc, char **argv) {
             "  \"norm_topk_prob\": true,\n  \"scoring_func\": \"%s\",\n  \"routed_scaling_factor\": %s,\n"
             "  \"rms_norm_eps\": 1e-06,\n  \"rope_theta\": 1000000.0,\n  \"max_position_embeddings\": 4096,\n"
             "  \"decoder_sparse_step\": 1,\n  \"mlp_only_layers\": [],\n  \"tie_word_embeddings\": false,\n"
-            "  \"torch_dtype\": \"float32\",\n  \"tierlm_synthetic\": {\"seed\": %ld, \"generator\": \"tlmc %s\"}\n}\n",
+            "  \"torch_dtype\": \"%s\",\n  \"tierlm_synthetic\": {\"seed\": %ld, \"generator\": \"tlmc %s\", "
+            "\"fp8\": %s}\n}\n",
             V, D, L, H, KV, hd, E, K, de, S, shared, router == 2 ? "sigmoid" : "softmax",
-            router == 2 ? "2.5" : "1.0", seed, TLMC_VERSION);
+            router == 2 ? "2.5" : "1.0", fp8 ? "float8_e4m3fn" : "float32", seed, TLMC_VERSION,
+            fp8 ? "true" : "false");
     if (fclose(f)) die("%s: write error", path);
     printf("tlmc: synthetic model in %s (%ld layers, d_model %ld, %ld experts top-%ld, d_expert %ld, "
-           "shared %ld, vocab %ld, %s router)\n",
-           out, L, D, E, K, de, S, V, router == 2 ? "sigmoid" : "softmax");
+           "shared %ld, vocab %ld, %s router%s)\n",
+           out, L, D, E, K, de, S, V, router == 2 ? "sigmoid" : "softmax",
+           fp8 ? ", FP8 E4M3 with 128x128 block scales" : "");
     return 0;
 }
 
@@ -873,18 +917,26 @@ static void pass_ingest(cc *c) {
 }
 
 /* Read a source tensor as f32 after checking its shape is [rows, cols]
- * (cols = 0 for 1-D). */
+ * (cols = 0 for 1-D). FP8 E4M3 weights go through tlm_st_read_fp8_block:
+ * decoded with the F32 `<name>_scale_inv` 128x128 block-scale grid, with
+ * 1-D FP8, missing or misshaped scales and E4M3 NaN codes refused
+ * (fail loudly, never guess, P-47). */
 static float *src_tensor(cc *c, const char *name, int64_t rows, int64_t cols) {
     const tlm_st_tensor *t = tlm_st_find(c->st, name);
     if (!t) die("ingest: tensor %s is missing", name);
     int ok = cols ? (t->ndim == 2 && t->shape[0] == rows && t->shape[1] == cols)
                   : ((t->ndim == 1 && t->shape[0] == rows) || (t->ndim == 2 && t->shape[0] == 1 && t->shape[1] == rows));
     if (!ok) die("ingest: tensor %s has an unexpected shape", name);
-    if (t->is_fp8) die("ingest: %s is FP8; FP8 checkpoints need their block scales (not supported here)", name);
-    float *p = (float *)malloc(sizeof(float) * (size_t)(rows * (cols ? cols : 1)));
+    int64_t n = rows * (cols ? cols : 1);
+    float *p = (float *)malloc(sizeof(float) * (size_t)n);
     if (!p) die("out of memory");
-    if (tlm_st_read_f32(c->st, t, p)) die("ingest: %s", tlm_errmsg());
-    for (int64_t i = 0; i < rows * (cols ? cols : 1); i++)
+    if (t->is_fp8) {
+        if (cols == 0) die("ingest: %s is FP8; 1-D FP8 tensors are not supported (norms and biases must be F32)", name);
+        if (tlm_st_read_fp8_block(c->st, t, p)) die("ingest: %s", tlm_errmsg());
+    } else if (tlm_st_read_f32(c->st, t, p)) {
+        die("ingest: %s", tlm_errmsg());
+    }
+    for (int64_t i = 0; i < n; i++)
         if (!isfinite(p[i])) die("ingest: %s contains NaN/Inf (P-05)", name);
     return p;
 }

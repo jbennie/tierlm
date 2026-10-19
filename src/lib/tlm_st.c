@@ -1,4 +1,4 @@
-/* tlm_st.c - safetensors reader and (F32) writer.
+/* tlm_st.c - safetensors reader and writer (F32/F16/BF16/F8_E4M3 tensors).
  *
  * Patterns: P-104 hardened safetensors indexing (header cap, overflow-checked
  * shapes, byte-span cross-check, index.json for shards, lazy positioned
@@ -413,13 +413,60 @@ int tlm_st_read_f32(tlm_st *st, const tlm_st_tensor *t, float *dst) {
     return rc;
 }
 
-/* ---- writer (F32 only) --------------------------------------------------- */
+/* FP8 (E4M3) 2-D weight -> f32, decoded with its block-scale tensor
+ * `<name>_scale_inv`: an F32 grid [ceil(rows/128)] x [ceil(cols/128)],
+ * row-major over the 128x128 block grid. The checkpoints' "scale_inv" is
+ * the multiplier (P-47). Refused: 1-D FP8 tensors, missing / non-F32 /
+ * misshaped scales, and E4M3 NaN codes 0x7F/0xFF (fail loudly, never
+ * guess). dst must hold rows x cols floats. */
+int tlm_st_read_fp8_block(tlm_st *st, const tlm_st_tensor *t, float *dst) {
+    if (!st || !t || !dst) return tlm_seterr(TLM_EINVAL, "read_fp8_block: bad argument");
+    if (!t->is_fp8) return tlm_seterr(TLM_EFORMAT, "%s: not an F8_E4M3 tensor", t->name);
+    if (t->ndim != 2)
+        return tlm_seterr(TLM_EUNSUP, "%s: 1-D FP8 tensors are not supported (norms and biases must be F32)", t->name);
+    int64_t rows = t->shape[0], cols = t->shape[1];
+    char snm[192];
+    snprintf(snm, sizeof snm, "%s_scale_inv", t->name);
+    const tlm_st_tensor *s = tlm_st_find(st, snm);
+    if (!s)
+        return tlm_seterr(TLM_ENOTFOUND, "%s is FP8 (E4M3) but its 128x128 block-scale tensor '%s' is missing",
+                          t->name, snm);
+    if (s->dtype != TLM_DT_F32)
+        return tlm_seterr(TLM_EFORMAT, "%s must be an F32 block-scale tensor (single-byte UE8M0 scales are not supported)",
+                          snm);
+    int64_t krb = (rows + 127) / 128, nkb = (cols + 127) / 128;
+    if (s->ndim != 2 || s->shape[0] != krb || s->shape[1] != nkb)
+        return tlm_seterr(TLM_EFORMAT, "%s has shape [%lld, %lld], expected [%lld, %lld] for 128x128 blocks of %s", snm,
+                          (long long)s->shape[0], (long long)s->shape[1], (long long)krb, (long long)nkb, t->name);
+    int64_t n = rows * cols;
+    uint8_t *codes = (uint8_t *)malloc(n ? (size_t)n : 1);
+    float *sc = (float *)malloc(sizeof(float) * (size_t)krb * (size_t)nkb);
+    if (!codes || !sc) { free(codes); free(sc); return tlm_seterr(TLM_ENOMEM, "out of memory"); }
+    int rc = tlm_st_read_raw(st, t, codes);
+    if (!rc)
+        for (int64_t i = 0; i < rows * cols; i++)
+            if ((codes[i] & 0x7F) == 0x7F) {
+                rc = tlm_seterr(TLM_EFORMAT, "%s contains an E4M3 NaN code 0x%02X at offset %lld; refusing to guess (P-47)",
+                                t->name, codes[i], (long long)i);
+                break;
+            }
+    if (!rc) rc = tlm_st_read_f32(st, s, sc);
+    if (!rc)
+        for (int64_t r = 0; r < rows && !rc; r++)
+            rc = tlm_dequantize_fp8_row(codes + r * cols, dst + r * cols, cols, sc + (r / 128) * nkb);
+    free(codes);
+    free(sc);
+    return rc;
+}
+
+/* ---- writer ------------------------------------------------------------ */
 typedef struct {
-    char    *name;
-    float   *data;
-    int      ndim;
-    int64_t  shape[4];
-    uint64_t nbytes;
+    char        *name;
+    const char  *dtype;          /* safetensors dtype string; must outlive the writer */
+    uint8_t     *data;
+    int          ndim;
+    int64_t      shape[4];
+    uint64_t     nbytes;
 } st_wtensor;
 
 struct tlm_st_writer {
@@ -431,9 +478,19 @@ tlm_st_writer *tlm_st_writer_new(void) {
     return (tlm_st_writer *)calloc(1, sizeof(tlm_st_writer));
 }
 
-int tlm_st_writer_add(tlm_st_writer *w, const char *name, const float *data, int ndim,
-                      const int64_t *shape) {
-    if (!w || !name || ndim < 0 || ndim > 4) return tlm_seterr(TLM_EINVAL, "st writer: bad tensor");
+static int dt_elsize(const char *dtype) {
+    if (strcmp(dtype, "F32") == 0) return 4;
+    if (strcmp(dtype, "F16") == 0) return 2;
+    if (strcmp(dtype, "BF16") == 0) return 2;
+    if (strcmp(dtype, "F8_E4M3") == 0) return 1;
+    return 0;
+}
+
+int tlm_st_writer_add_raw(tlm_st_writer *w, const char *name, const char *dtype, const void *data,
+                          uint64_t nbytes, int ndim, const int64_t *shape) {
+    if (!w || !name || !dtype || ndim < 0 || ndim > 4) return tlm_seterr(TLM_EINVAL, "st writer: bad tensor");
+    int es = dt_elsize(dtype);
+    if (!es) return tlm_seterr(TLM_EINVAL, "st writer: unsupported dtype '%s'", dtype);
     int bad = name[0] == 0 || strlen(name) >= sizeof(((tlm_st_tensor *)0)->name) ||
               strcmp(name, "__metadata__") == 0;
     for (const char *c = name; *c && !bad; c++)   /* written into JSON unescaped */
@@ -446,6 +503,9 @@ int tlm_st_writer_add(tlm_st_writer *w, const char *name, const float *data, int
         if (shape[i] < 0) return tlm_seterr(TLM_EINVAL, "st writer: negative dim");
         numel *= (uint64_t)shape[i];
     }
+    if (nbytes != numel * (uint64_t)es)
+        return tlm_seterr(TLM_EINVAL, "st writer: %s has %llu bytes, expected %llu for %s shape", name,
+                          (unsigned long long)nbytes, (unsigned long long)(numel * (uint64_t)es), dtype);
     if (w->n == w->cap) {
         int nc = w->cap ? w->cap * 2 : 64;
         st_wtensor *nt = (st_wtensor *)realloc(w->t, (size_t)nc * sizeof *nt);
@@ -456,14 +516,22 @@ int tlm_st_writer_add(tlm_st_writer *w, const char *name, const float *data, int
     st_wtensor *t = &w->t[w->n];
     memset(t, 0, sizeof *t);
     t->name = strdup(name);
-    t->nbytes = numel * 4;
-    t->data = (float *)malloc(t->nbytes ? (size_t)t->nbytes : 1);
+    t->dtype = dtype;
+    t->nbytes = nbytes;
+    t->data = (uint8_t *)malloc(nbytes ? nbytes : 1);
     if (!t->name || !t->data) { free(t->name); free(t->data); return tlm_seterr(TLM_ENOMEM, "st writer: out of memory"); }
-    if (t->nbytes) memcpy(t->data, data, (size_t)t->nbytes);
+    if (nbytes) memcpy(t->data, data, nbytes);
     t->ndim = ndim;
     for (int i = 0; i < ndim; i++) t->shape[i] = shape[i];
     w->n++;
     return TLM_OK;
+}
+
+int tlm_st_writer_add(tlm_st_writer *w, const char *name, const float *data, int ndim,
+                      const int64_t *shape) {
+    uint64_t numel = 1;
+    for (int i = 0; i < ndim; i++) numel *= (uint64_t)shape[i];
+    return tlm_st_writer_add_raw(w, name, "F32", data, numel * 4, ndim, shape);
 }
 
 /* Growable text buffer for the header JSON. */
@@ -495,7 +563,7 @@ int tlm_st_writer_save(tlm_st_writer *w, const char *path) {
     uint64_t off = 0;
     for (int i = 0; i < w->n; i++) {
         st_wtensor *t = &w->t[i];
-        sb_printf(&hb, ",\"%s\":{\"dtype\":\"F32\",\"shape\":[", t->name);
+        sb_printf(&hb, ",\"%s\":{\"dtype\":\"%s\",\"shape\":[", t->name, t->dtype);
         for (int d = 0; d < t->ndim; d++) sb_printf(&hb, "%s%lld", d ? "," : "", (long long)t->shape[d]);
         sb_printf(&hb, "],\"data_offsets\":[%llu,%llu]}", (unsigned long long)off,
                   (unsigned long long)(off + t->nbytes));

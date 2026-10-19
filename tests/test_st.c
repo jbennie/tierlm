@@ -210,6 +210,110 @@ static void test_dtypes(void) {
     tlm_st_close(st);
 }
 
+/* add_raw writes F8_E4M3 bytes back exactly and the header dtype survives;
+ * size/dtype mismatches are refused. */
+static void test_writer_raw(void) {
+    char p[256];
+    path_of(p, sizeof p, "raw.safetensors");
+    tlm_st_writer *w = tlm_st_writer_new();
+    CHECK(w != NULL);
+    if (!w) return;
+    uint8_t codes[32];
+    for (int i = 0; i < 32; i++) codes[i] = (uint8_t)i;
+    float sc[4] = {1.0f, -2.0f, 0.5f, 448.0f};
+    int64_t shw[2] = {4, 8}, shs[2] = {1, 4};
+    CHECK_EQ_INT(tlm_st_writer_add_raw(w, "w", "F8_E4M3", codes, 32, 2, shw), 0);
+    CHECK_EQ_INT(tlm_st_writer_add(w, "w_scale_inv", sc, 2, shs), 0);
+    CHECK(tlm_st_writer_add_raw(w, "bad", "F8_E4M3", codes, 31, 2, shw) != 0);
+    CHECK(tlm_st_writer_add_raw(w, "bad2", "F64", codes, 32, 2, shw) != 0);
+    CHECK_EQ_INT(tlm_st_writer_save(w, p), 0);
+    tlm_st_writer_free(w);
+    tlm_st *st = tlm_st_open(p);
+    CHECK(st != NULL);
+    if (st) {
+        const tlm_st_tensor *t = tlm_st_find(st, "w");
+        CHECK(t && t->is_fp8 && t->dtype == TLM_DT_FP8E4M3_B128 && t->nbytes == 32);
+        uint8_t r[32] = {0};
+        CHECK(t && tlm_st_read_raw(st, t, r) == 0 && memcmp(r, codes, sizeof r) == 0);
+        t = tlm_st_find(st, "w_scale_inv");
+        float rsc[4] = {0};
+        CHECK(t && t->dtype == TLM_DT_F32 && !t->is_fp8 && tlm_st_read_f32(st, t, rsc) == 0 &&
+              memcmp(rsc, sc, sizeof sc) == 0);
+    }
+    tlm_st_close(st);
+}
+
+/* FP8 block-scale decode: scales applied per 128x128 grid (partial row and
+ * column blocks), and the refused cases: missing scale, non-F32 scale,
+ * misshaped scale, 1-D FP8, E4M3 NaN code. */
+static void test_fp8_block(void) {
+    char p[256];
+    path_of(p, sizeof p, "fp8b.safetensors");
+    const int64_t rows = 192, cols = 320;   /* 2 row blocks, 3 column blocks (last partial) */
+    uint8_t *codes = (uint8_t *)calloc(1, (size_t)rows * (size_t)cols);
+    float sc[6] = {2.0f, 0.5f, 8.0f, 4.0f, 1.0f, 0.25f};
+    if (!codes) return;
+    codes[0] = 0x38;                 /* 1.0  x 2.0  = 2.0     (block 0,0) */
+    codes[128] = 0x38;               /* 1.0  x 0.5  = 0.5     (block 0,1) */
+    codes[256] = 0x48;               /* 4.0  x 8.0  = 32.0    (block 0,2, partial) */
+    codes[128 * cols + 2] = 0x01;    /* 2^-9 x 4.0  = 2^-7    (block 1,0) */
+    codes[128 * cols + 256] = 0x7E;  /* 448  x 0.25 = 112.0   (block 1,2, partial) */
+    uint8_t zero[192 * 128] = {0};   /* also serves the 192x128 "b" */
+    uint8_t nan[128 * 128] = {0};
+    nan[5] = 0x7F;
+    float one = 1.0f;
+    uint16_t oneh = tlm_f32_to_f16(1.0f);
+    int64_t sh2[2], sh1[1], shg[2], shb[2];
+    sh2[0] = 128; sh2[1] = 128; sh1[0] = 128; shg[0] = 1; shg[1] = 1; shb[0] = 192; shb[1] = 128;
+    tlm_st_writer *w = tlm_st_writer_new();
+    CHECK(w != NULL);
+    if (!w) { free(codes); return; }
+    int64_t shw[2] = {rows, cols};
+    CHECK_EQ_INT(tlm_st_writer_add_raw(w, "w", "F8_E4M3", codes, (uint64_t)rows * (uint64_t)cols, 2, shw), 0);
+    int64_t shs[2] = {2, 3};
+    CHECK_EQ_INT(tlm_st_writer_add(w, "w_scale_inv", sc, 2, shs), 0);
+    CHECK_EQ_INT(tlm_st_writer_add_raw(w, "m", "F8_E4M3", zero, 128 * 128, 2, sh2), 0);   /* no scale */
+    CHECK_EQ_INT(tlm_st_writer_add_raw(w, "b", "F8_E4M3", zero, sizeof zero, 2, shb), 0);
+    CHECK_EQ_INT(tlm_st_writer_add(w, "b_scale_inv", &one, 2, shg), 0);                      /* misshaped */
+    CHECK_EQ_INT(tlm_st_writer_add_raw(w, "s2", "F8_E4M3", zero, 128 * 128, 2, sh2), 0);
+    CHECK_EQ_INT(tlm_st_writer_add_raw(w, "s2_scale_inv", "F16", &oneh, 2, 2, shg), 0);          /* F16 scale */
+    CHECK_EQ_INT(tlm_st_writer_add_raw(w, "d1", "F8_E4M3", zero, 128, 1, sh1), 0);           /* 1-D */
+    CHECK_EQ_INT(tlm_st_writer_add_raw(w, "n", "F8_E4M3", nan, sizeof nan, 2, sh2), 0);
+    CHECK_EQ_INT(tlm_st_writer_add(w, "n_scale_inv", &one, 2, shg), 0);
+    CHECK_EQ_INT(tlm_st_writer_save(w, p), 0);
+    tlm_st_writer_free(w);
+    tlm_st *st = tlm_st_open(p);
+    CHECK(st != NULL);
+    float tmp[4];
+    if (st) {
+        const tlm_st_tensor *t = tlm_st_find(st, "w");
+        float *dst = (float *)malloc(sizeof(float) * (size_t)rows * (size_t)cols);
+        CHECK(t && dst && tlm_st_read_fp8_block(st, t, dst) == 0);
+        if (dst) {
+            CHECK(dst[0] == 2.0f);
+            CHECK(dst[128] == 0.5f);
+            CHECK(dst[256] == 32.0f);
+            CHECK(dst[128 * cols + 2] == 0x1p-7f);
+            CHECK(dst[128 * cols + 256] == 112.0f);
+            CHECK(dst[cols + 130] == 0.0f);              /* zero code */
+            CHECK(dst[rows * cols - 1] == 0.0f);
+        }
+        free(dst);
+        t = tlm_st_find(st, "d1");
+        CHECK(t && tlm_st_read_fp8_block(st, t, tmp) == TLM_EUNSUP);
+        t = tlm_st_find(st, "m");
+        CHECK(t && tlm_st_read_fp8_block(st, t, tmp) == TLM_ENOTFOUND);
+        t = tlm_st_find(st, "b");
+        CHECK(t && tlm_st_read_fp8_block(st, t, tmp) == TLM_EFORMAT);
+        t = tlm_st_find(st, "s2");
+        CHECK(t && tlm_st_read_fp8_block(st, t, tmp) == TLM_EFORMAT);
+        t = tlm_st_find(st, "n");
+        CHECK(t && tlm_st_read_fp8_block(st, t, tmp) == TLM_EFORMAT);
+    }
+    tlm_st_close(st);
+    free(codes);
+}
+
 static int open_fails(const char *hdr, size_t dlen, int raw_len_override, uint64_t len_value) {
     char p[256];
     path_of(p, sizeof p, "bad.safetensors");
@@ -360,6 +464,8 @@ int main(void) {
     RUN(test_roundtrip);
     RUN(test_writer_many);
     RUN(test_dtypes);
+    RUN(test_writer_raw);
+    RUN(test_fp8_block);
     RUN(test_malformed);
     RUN(test_sharded);
     rm_rf(g_root);
