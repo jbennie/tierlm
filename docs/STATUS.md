@@ -18,9 +18,9 @@ clean tree. The code is about 16k lines of C in `src/`, plus 6k lines of tests.
 | Expert store: fixed slot arena, reserve → loading → ready → released, global LFU with decay, pins, warm sidecar, prefetch that never displaces demand | done | `test_store`, the e2e tiny-vs-large cache check |
 | Worker pool: chunk claiming, deterministic split, L3-grouped pinning | done | `test_pool` |
 | safetensors reader (single and sharded) and writer (F32/F16/BF16/F8_E4M3 raw tensors); `tlm_st_read_fp8_block` decodes E4M3 weights with their `<name>_scale_inv` 128×128 F32 block-scale grid | done | `test_st` (writer round-trips, block-scale decode incl. partial blocks; refused: missing/non-F32/misshaped scales, 1-D FP8, E4M3 NaN codes) |
-| MoE decoder: RMSNorm, GQA with qk-norm, RoPE (NeoX), softmax and sigmoid+bias routers, SwiGLU experts + shared expert, fixed combine order, KV cache, sampler, router-lookahead prefetch, expert mask | done | `test_model` (invariance across threads, cache sizes, kernels) |
+| MoE decoder: RMSNorm, GQA with qk-norm, RoPE (NeoX), softmax and sigmoid+bias routers, SwiGLU experts + shared expert, dense-FFN layers (`first_k_dense_replace`/`mlp_only_layers`, resident SwiGLU, no router), fixed combine order, KV cache, sampler, router-lookahead prefetch, expert mask | done | `test_model` (invariance across threads, cache sizes, kernels; dense prefix vs naive reference) |
 | Decision engine: Choice / Score / Noul questions, rules backend, SELF callback, confidence policy, JSONL audit log | done (rules) | `test_decide` |
-| `tlmc`: synth (incl. `--fp8` block-scale checkpoints), compile passes 1–9 (exact / balanced / aggressive) over BF16/F16/F32 and FP8 E4M3 + 128×128 block-scale checkpoints, resume, REAP pruning with an eval gate, Q5_K demotion, heat-balanced placement with pins and replicas, report, atlas | done for Qwen3-MoE-like checkpoints | `tests/e2e.sh` (incl. the `synth --fp8` compile + run step) |
+| `tlmc`: synth (incl. `--fp8` block-scale and `--dense-layers` checkpoints), compile passes 1–9 (exact / balanced / aggressive) over BF16/F16/F32 and FP8 E4M3 + 128×128 block-scale checkpoints, resume, REAP pruning with an eval gate, Q5_K demotion, heat-balanced placement with pins and replicas, report, atlas | done for Qwen3-MoE-like checkpoints (mixed dense + routed) | `tests/e2e.sh` (incl. the `synth --fp8` compile + run step; dense-prefix synth/compile/run) |
 | `tierlm`: run, bench, config show/check, missing-drive fallback to replicas | done | `tests/e2e.sh` |
 
 Kernel throughput measured in the build container (single thread, AVX-512, -O2) was 20.4 GB/s for
@@ -37,10 +37,11 @@ These are the gaps that stop tierlm from running a real model today.
    the real tokenizer before its calibration statistics mean anything. This needs BPE plus the
    chat template, with the parity gates of P-127.
 2. **Narrow ingest.** `tlmc compile` takes BF16/F16/F32 safetensors, and FP8 E4M3 safetensors with
-   f32 128×128 block scales, for Qwen3-MoE / Qwen2-MoE style decoders: every layer MoE, no
-   attention biases, plain RoPE (`rope_scaling` is ignored with a warning). It refuses the following:
+   f32 128×128 block scales, for Qwen3-MoE / Qwen2-MoE style decoders: no attention biases, plain
+   RoPE (`rope_scaling` is ignored with a warning). Dense-FFN prefix layers
+   (`first_k_dense_replace`, `mlp_only_layers`) are supported: those layers become resident SwiGLU
+   DENSE packets (no router, no experts), mixed with routed MoE layers. It refuses the following:
    - FP8 checkpoints with single-byte UE8M0 block scales (DeepSeek-V4 class)
-   - dense-FFN prefix layers (`first_k_dense_replace`, `mlp_only_layers`)
    - MLA attention (DeepSeek V3/V4), GGUF input, and native MXFP4 experts
 3. **No MTP speculation.** `spec.mode = mtp` is accepted by the config schema, but the runtime warns
    and decodes without it. The packet type (`TLM_PKT_MTP`) and `geom.mtp_layers` exist.

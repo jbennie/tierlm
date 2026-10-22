@@ -105,12 +105,17 @@ int  tlm_kv_capacity(const tlm_kv *kv);
 
 /* ---- notes (tlm_model.c) ------------------------------------------------
  * Packets: DENSE layer l holds attn_norm, ffn_norm, attn_q [H*hd, D],
- *   attn_k/attn_v [KV*hd, D], attn_o [D, H*hd], router [E, D] and optional
- *   router_bias [1, E], q_norm/k_norm [1, hd] (per-head qk-norm, applied when
- *   present), shared_gate/shared_up [S, D], shared_down [D, S],
- *   shared_gate_inp [1, D] (sigmoid scalar gate). META: output_norm, lm_head
- *   [V, D]. EMBED: tok_embd [V, D]. Vectors may be any dtype (converted to
- *   f32 once); matrices any row-quantised dtype except Q8_K/FP8.
+ *   attn_k/attn_v [KV*hd, D], attn_o [D, H*hd] and optional q_norm/k_norm
+ *   [1, hd] (per-head qk-norm, applied when present). The FFN is either a
+ *   router + experts (router [E, D] and optional router_bias [1, E],
+ *   shared_gate/shared_up [S, D], shared_down [D, S], shared_gate_inp [1, D]
+ *   sigmoid scalar gate) or, for a dense layer (first_k_dense_replace /
+ *   mlp_only_layers), a resident SwiGLU block: ffn_gate/ffn_up [d_ffn, D],
+ *   ffn_down [D, d_ffn]; a dense layer carries no router and no EXPERT
+ *   packets, and d_ffn is read from the ffn_gate shape. META: output_norm,
+ *   lm_head [V, D]. EMBED: tok_embd [V, D]. Vectors may be any dtype
+ *   (converted to f32 once); matrices any row-quantised dtype except
+ *   Q8_K/FP8.
  *   EXPERT: payload = gate [de, D] | up [de, D] | down [D, de] rows at
  *   item_off[0..2], dtype from the packet header (may differ per expert).
  * tlm_model_open reads every resident packet (CRC-checked, replica fallback)

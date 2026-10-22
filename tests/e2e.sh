@@ -1,7 +1,8 @@
 #!/bin/sh
 # tests/e2e.sh - end-to-end check of the two stages (research/03-two-stage-design.md):
 #   synth -> compile exact over 3 drive dirs -> run with a tiny and a large
-#   cache (outputs must be equal) -> recompile (resume reuses passes 2-3) ->
+#   cache (outputs must be equal) -> synth+compile+run a dense-prefix model
+#   (first_k_dense_replace) -> recompile (resume reuses passes 2-3) ->
 #   compile balanced with pruning + q5_k plan -> report -> atlas -> run ->
 #   compile aggressive with a content exclusion -> config show/check ->
 #   missing-drive refusal.
@@ -76,6 +77,24 @@ grep -v -e '^--' -e '^[a-z]' -e '^  drive' -e 'tierlm warn' "$T/fp8t.out" > "$T/
 cp "$T/fp8l.out" "$T/fp8l.tok"
 [ "$(wc -w < "$T/fp8l.tok")" -eq 16 ] || fail "expected 16 tokens from the fp8 store"
 cmp -s "$T/fp8t.tok" "$T/fp8l.tok" || { cat "$T/fp8t.tok" "$T/fp8l.tok" >&2; fail "fp8 store: tiny and large cache differ"; }
+
+step "synth + compile + run a dense-prefix model (first_k_dense_replace)"
+run_logged "$T/synthd.log" "$B/tlmc" synth --out "$T/srcd" --layers 3 --experts 16 --top-k 2 --shared 1 \
+    --seed 7 --dense-layers 2 --dense-ffn 128
+grep -q '"first_k_dense_replace": 2' "$T/srcd/config.json" || fail "synth did not emit first_k_dense_replace"
+grep -q '"intermediate_size": 128' "$T/srcd/config.json" || fail "synth did not emit intermediate_size"
+run_logged "$T/exactd.log" "$B/tlmc" compile "$T/srcd" --out "$T/models/dense.tlmm" --drives "$D3" \
+    --profile exact --replicas auto
+grep -q "bit-identical logits yes, greedy free run identical yes" "$T/exactd.log" || fail "dense exact not identical to pass 2"
+# 3 DENSE packets + 1 routed layer x 16 experts + META + EMBED = 21 packets
+grep -q "21 packets on 3 drives" "$T/exactd.log" || fail "dense store has the wrong packet count"
+run_logged "$T/dtiny.out" "$B/tierlm" run "$T/models/dense.tlmm" --prompt "$P" -n 24 --cache 1 --print-tokens --stats
+run_logged "$T/dlarge.out" "$B/tierlm" run "$T/models/dense.tlmm" --prompt "$P" -n 24 --cache 1G --threads 1 \
+    --prefetch off --print-tokens
+grep -v -e '^--' -e '^[a-z]' -e '^  drive' -e 'tierlm warn' "$T/dtiny.out" > "$T/dtiny.tok"
+cp "$T/dlarge.out" "$T/dlarge.tok"
+[ "$(wc -w < "$T/dlarge.tok")" -eq 24 ] || fail "dense run gave $(wc -w < "$T/dlarge.tok") tokens, expected 24"
+cmp -s "$T/dtiny.tok" "$T/dlarge.tok" || { cat "$T/dtiny.tok" "$T/dlarge.tok" >&2; fail "dense: tiny and large cache differ"; }
 
 step "recompile (exact): passes 2 and 3 resume from the work dir"
 run_logged "$T/exact2.log" "$B/tlmc" compile "$T/src" --out "$T/models/exact.tlmm" --drives "$D3" --profile exact

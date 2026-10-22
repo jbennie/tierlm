@@ -55,7 +55,10 @@ typedef struct {
     const float *attn_norm, *ffn_norm, *q_norm, *k_norm, *router_bias, *shared_gate_inp;
     wmat         q, k, v, o, router;
     wmat         sg, su, sd;
+    wmat         dg, du, dd;      /* dense-FFN gate/up/down (has_dense_ffn) */
     int          has_shared;
+    int          has_dense_ffn;   /* layer is a dense FFN, not a router + experts */
+    int64_t      d_ffn;           /* dense FFN intermediate width */
     uint8_t     *buf;            /* packet buffer (owned) */
 } layer_w;
 
@@ -97,6 +100,9 @@ struct tlm_model {
     actc   a_e[MAX_TOPK];
     float *sg_buf, *sh_buf, *s_out;
     actc   a_sh;
+    float *dg_buf, *dh_buf;      /* dense-FFN gate/up (adjacent) and silu(g)*u */
+    actc   a_dh;
+    int64_t d_ffn_max;           /* widest dense FFN across layers (scratch sizing) */
 
     tlm_route_hook hook;
     void          *hook_ctx;
@@ -300,19 +306,33 @@ static int load_layer(tlm_model *M, const tlm_manifest *m, int l) {
     if ((rc = dir_mat(pl, plen, "attn_k", KV * hd, D, 1, &L->k, NULL))) return rc;
     if ((rc = dir_mat(pl, plen, "attn_v", KV * hd, D, 1, &L->v, NULL))) return rc;
     if ((rc = dir_mat(pl, plen, "attn_o", D, H * hd, 1, &L->o, NULL))) return rc;
-    if (E > 0) {
+    const tlm_tensor_ref *fg = (E > 0) ? tlm_dir_find(pl, plen, "ffn_gate") : NULL;
+    if (fg) {
+        /* Dense FFN layer (first_k_dense_replace / mlp_only_layers): no router
+         * and no experts, one resident SwiGLU block (F-fwd-01, F-fwd-18). */
+        int64_t dffn = (int64_t)fg->shape[0];
+        if ((int64_t)fg->shape[1] != D)
+            return tlm_seterr(TLM_EFORMAT, "layer %d: ffn_gate shape [%llu,%llu] != [?,%lld]", l,
+                              (unsigned long long)fg->shape[0], (unsigned long long)fg->shape[1], (long long)D);
+        if ((rc = dir_mat(pl, plen, "ffn_gate", dffn, D, 1, &L->dg, NULL))) return rc;
+        if ((rc = dir_mat(pl, plen, "ffn_up", dffn, D, 1, &L->du, NULL))) return rc;
+        if ((rc = dir_mat(pl, plen, "ffn_down", D, dffn, 1, &L->dd, NULL))) return rc;
+        L->has_dense_ffn = 1;
+        L->d_ffn = dffn;
+        if (dffn > M->d_ffn_max) M->d_ffn_max = dffn;
+    } else if (E > 0) {
         if ((rc = dir_mat(pl, plen, "router", E, D, 1, &L->router, NULL))) return rc;
         if ((rc = dir_vec(M, pl, plen, "router_bias", E, 0, &L->router_bias))) return rc;
         if (g->router == 2 && !L->router_bias)
             tlm_log(TLM_LOG_DEBUG, "layer %d: sigmoid router without router_bias (bias = 0)", l);
-    }
-    if (g->n_shared > 0 && g->d_shared > 0) {
-        int64_t S = g->d_shared;
-        if ((rc = dir_mat(pl, plen, "shared_gate", S, D, 1, &L->sg, NULL))) return rc;
-        if ((rc = dir_mat(pl, plen, "shared_up", S, D, 1, &L->su, NULL))) return rc;
-        if ((rc = dir_mat(pl, plen, "shared_down", D, S, 1, &L->sd, NULL))) return rc;
-        if ((rc = dir_vec(M, pl, plen, "shared_gate_inp", D, 0, &L->shared_gate_inp))) return rc;
-        L->has_shared = 1;
+        if (g->n_shared > 0 && g->d_shared > 0) {
+            int64_t S = g->d_shared;
+            if ((rc = dir_mat(pl, plen, "shared_gate", S, D, 1, &L->sg, NULL))) return rc;
+            if ((rc = dir_mat(pl, plen, "shared_up", S, D, 1, &L->su, NULL))) return rc;
+            if ((rc = dir_mat(pl, plen, "shared_down", D, S, 1, &L->sd, NULL))) return rc;
+            if ((rc = dir_vec(M, pl, plen, "shared_gate_inp", D, 0, &L->shared_gate_inp))) return rc;
+            L->has_shared = 1;
+        }
     }
     return TLM_OK;
 }
@@ -380,6 +400,7 @@ static int load_experts(tlm_model *M, const tlm_manifest *m) {
     tlm_free_aligned(hb);
     if (rc) return rc;
     for (uint32_t l = 0; l < g->n_layers; l++) {
+        if (M->L[l].has_dense_ffn) continue;   /* no experts to route */
         int live = 0;
         for (uint32_t e = 0; e < g->n_experts; e++) {
             size_t ix = (size_t)l * g->n_experts + e;
@@ -416,6 +437,12 @@ static int alloc_scratch(tlm_model *M) {
             !(M->s_out = track(M, (size_t)D)))
             return TLM_ENOMEM;
         if (actc_init(M, &M->a_sh, ds)) return TLM_ENOMEM;
+    }
+    if (M->d_ffn_max > 0) {
+        if (!(M->dg_buf = track(M, (size_t)(2 * M->d_ffn_max))) ||
+            !(M->dh_buf = track(M, (size_t)M->d_ffn_max)))
+            return TLM_ENOMEM;
+        if (actc_init(M, &M->a_dh, (int64_t)M->d_ffn_max)) return TLM_ENOMEM;
     }
     return TLM_OK;
 }
@@ -558,6 +585,7 @@ void tlm_model_set_route_hook(tlm_model *M, tlm_route_hook fn, void *ctx) {
 int tlm_model_set_expert_mask(tlm_model *M, const uint8_t *pruned) {
     const tlm_model_geom *g = &M->g;
     for (uint32_t l = 0; l < g->n_layers; l++) {
+        if (M->L[l].has_dense_ffn) continue;   /* no experts to mask */
         int live = 0;
         for (uint32_t e = 0; e < g->n_experts; e++) {
             size_t ix = (size_t)l * g->n_experts + e;
@@ -566,11 +594,13 @@ int tlm_model_set_expert_mask(tlm_model *M, const uint8_t *pruned) {
         if (live < (int)g->top_k)
             return tlm_seterr(TLM_EINVAL, "mask leaves layer %u with %d experts (top_k %u)", l, live, g->top_k);
     }
-    for (uint32_t l = 0; l < g->n_layers; l++)
+    for (uint32_t l = 0; l < g->n_layers; l++) {
+        if (M->L[l].has_dense_ffn) continue;
         for (uint32_t e = 0; e < g->n_experts; e++) {
             size_t ix = (size_t)l * g->n_experts + e;
             M->mask[ix] = (uint8_t)(!M->ex[ix].present || (pruned && pruned[ix]));
         }
+    }
     return TLM_OK;
 }
 
@@ -781,6 +811,7 @@ static void route(tlm_model *M, int l, float *logits, int k, int *ids, float *w)
 static void lookahead(tlm_model *M, int l) {
     const tlm_model_geom *g = &M->g;
     if (!M->store || l >= (int)g->n_layers || M->o.lookahead <= 0 || g->n_experts == 0) return;
+    if (M->L[l].has_dense_ffn) return;   /* no router to predict */
     int k = M->o.lookahead_k, ids[MAX_TOPK * 4];
     float w[MAX_TOPK * 4];
     if (k > MAX_TOPK * 4) k = MAX_TOPK * 4;
@@ -861,6 +892,26 @@ static int moe(tlm_model *M, int l, int pos, int token) {
     int D = (int)g->d_model, k = (int)g->top_k;
     rmsnorm(M->xb, M->h, L->ffn_norm, D, g->norm_eps);
     actc_set(&M->a_ffn, M->xb);
+    if (L->has_dense_ffn) {
+        /* Resident SwiGLU block: gate/up in one pool pass, down in another,
+         * added to the residual (F-fwd-18, the expert FFN with one expert). */
+        int64_t dffn = L->d_ffn;
+        mv_job j;
+        j.nseg = 0;
+        j.work = 0;
+        mv_add(&j, &L->dg, actc_get(&M->a_ffn, L->dg.dt), M->dg_buf);
+        mv_add(&j, &L->du, actc_get(&M->a_ffn, L->du.dt), M->dg_buf + dffn);
+        mv_exec(M, &j);
+        float *gg = M->dg_buf, *uu = M->dg_buf + dffn;
+        for (int64_t i = 0; i < dffn; i++) M->dh_buf[i] = silu(gg[i]) * uu[i];
+        actc_set(&M->a_dh, M->dh_buf);
+        j.nseg = 0;
+        j.work = 0;
+        mv_add(&j, &L->dd, actc_get(&M->a_dh, L->dd.dt), M->ffn);
+        mv_exec(M, &j);
+        for (int i = 0; i < D; i++) M->h[i] += M->ffn[i];
+        return TLM_OK;
+    }
     int ids[MAX_TOPK];
     float w[MAX_TOPK], onorm[MAX_TOPK];
     tlm_expert_ref refs[MAX_TOPK];

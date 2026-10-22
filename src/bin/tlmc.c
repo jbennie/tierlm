@@ -3,7 +3,7 @@
  *   tlmc synth   --out DIR [--layers N --d-model N --heads N --kv-heads N
  *                --head-dim N --experts N --top-k N --d-expert N --shared N
  *                --vocab N --seed N --router softmax|sigmoid --qk-norm yes|no
- *                [--fp8]
+ *                [--fp8] [--yarn] [--dense-layers N --dense-ffn N]
  *   tlmc compile SRC --out MANIFEST --drives d1,d2,... [--experts q6_k]
  *                [--dense q8_0] [--profile exact|balanced|aggressive]
  *                [--replicas auto|none] [--corpus FILE] [--eval FILE]
@@ -268,7 +268,7 @@ static void st_put(tlm_st_writer *w, const char *name, float *data, int ndim, in
 
 static int cmd_synth(int argc, char **argv) {
     long L = 4, D = 256, H = 4, KV = 2, hd = 64, E = 16, K = 2, de = 256, shared = 1, V = 512;
-    long seed = 1, qk = 1, router = 0, fp8 = 0;
+    long seed = 1, qk = 1, router = 0, fp8 = 0, dense_layers = 0, ff = 0;
     int yarn = 0;
     const char *out = NULL;
     for (int i = 2; i < argc; i++) {
@@ -298,6 +298,8 @@ static int cmd_synth(int argc, char **argv) {
         } else if (!strcmp(a, "--fp8")) fp8 = 1;
         else if (!strcmp(a, "--yarn"))
             yarn = 1;
+        else if (!strcmp(a, "--dense-layers")) dense_layers = num_arg(need(argc, argv, &i), a, 0, 511);
+        else if (!strcmp(a, "--dense-ffn")) ff = num_arg(need(argc, argv, &i), a, 32, 65536);
         else die("synth: unknown option %s", a);
     }
     if (!out) die("synth: --out DIR is required");
@@ -305,6 +307,11 @@ static int cmd_synth(int argc, char **argv) {
     if (hd % 2) die("synth: --head-dim must be even");
     if (K > E) die("synth: --top-k exceeds --experts");
     if (D % 32 || de % 32) die("synth: --d-model and --d-expert must be multiples of 32");
+    if (dense_layers >= L) die("synth: --dense-layers must leave at least one routed layer");
+    if (dense_layers > 0) {
+        if (!ff) ff = de;
+        if (ff % 32) die("synth: --dense-ffn must be a multiple of 32");
+    }
     if (tlm_mkdirs(out, 0755)) die("%s", tlm_errmsg());
 
     rng_t r = {(uint64_t)seed * 0x9E3779B97F4A7C15ull + 12345};
@@ -339,39 +346,46 @@ static int cmd_synth(int argc, char **argv) {
             st_put(w, NM("self_attn.k_norm.weight"), randn(&r, (size_t)hd, 0.1f, 1.0f), 1, hd, 0, fp8);
         }
         st_put(w, NM("post_attention_layernorm.weight"), randn(&r, (size_t)D, 0.1f, 1.0f), 1, D, 0, fp8);
-        int *perm = (int *)malloc(sizeof(int) * (size_t)E);
-        for (long e = 0; e < E; e++) perm[e] = (int)e;
-        for (long e = E - 1; e > 0; e--) {
-            long j = (long)(rng_next(&r) % (uint64_t)(e + 1));
-            int t = perm[e];
-            perm[e] = perm[j];
-            perm[j] = t;
-        }
-        float *gate = randn(&r, (size_t)E * D, sd_in, 0);
-        for (long e = 0; e < E; e++) {
-            float a = E > 1 ? 1.0f - 2.0f * (float)perm[e] / (float)(E - 1) : 0.0f;
-            /* x = rmsnorm(h) has x.u ~ 0.7 sqrt(D), so this adds ~1.1a to
-             * the logit against unit-variance noise from the random part */
-            for (long i = 0; i < D; i++) gate[e * D + i] += 1.6f / sqrtf((float)D) * a * u[i];
-        }
-        free(perm);
-        st_put(w, NM("mlp.gate.weight"), gate, 2, E, D, fp8);
-        if (router == 2)
-            st_put(w, NM("mlp.gate.e_score_correction_bias"), randn(&r, (size_t)E, 0.05f, 0), 1, E, 0, fp8);
-        for (long e = 0; e < E; e++) {
-            char en[200];
-            snprintf(en, sizeof en, "model.layers.%ld.mlp.experts.%ld.gate_proj.weight", l, e);
-            st_put(w, en, randn(&r, (size_t)de * D, sd_in, 0), 2, de, D, fp8);
-            snprintf(en, sizeof en, "model.layers.%ld.mlp.experts.%ld.up_proj.weight", l, e);
-            st_put(w, en, randn(&r, (size_t)de * D, sd_in, 0), 2, de, D, fp8);
-            snprintf(en, sizeof en, "model.layers.%ld.mlp.experts.%ld.down_proj.weight", l, e);
-            st_put(w, en, randn(&r, (size_t)D * de, 0.5f / sqrtf((float)de), 0), 2, D, de, fp8);
-        }
-        if (S > 0) {
-            st_put(w, NM("mlp.shared_expert.gate_proj.weight"), randn(&r, (size_t)S * D, sd_in, 0), 2, S, D, fp8);
-            st_put(w, NM("mlp.shared_expert.up_proj.weight"), randn(&r, (size_t)S * D, sd_in, 0), 2, S, D, fp8);
-            st_put(w, NM("mlp.shared_expert.down_proj.weight"), randn(&r, (size_t)D * S, 0.5f / sqrtf((float)S), 0),
-                   2, D, S, fp8);
+        if (l < dense_layers) {
+            /* Dense-FFN layer: one SwiGLU block, no router or experts. */
+            st_put(w, NM("mlp.gate_proj.weight"), randn(&r, (size_t)ff * D, sd_in, 0), 2, ff, D, fp8);
+            st_put(w, NM("mlp.up_proj.weight"), randn(&r, (size_t)ff * D, sd_in, 0), 2, ff, D, fp8);
+            st_put(w, NM("mlp.down_proj.weight"), randn(&r, (size_t)D * ff, 0.5f / sqrtf((float)ff), 0), 2, D, ff, fp8);
+        } else {
+            int *perm = (int *)malloc(sizeof(int) * (size_t)E);
+            for (long e = 0; e < E; e++) perm[e] = (int)e;
+            for (long e = E - 1; e > 0; e--) {
+                long j = (long)(rng_next(&r) % (uint64_t)(e + 1));
+                int t = perm[e];
+                perm[e] = perm[j];
+                perm[j] = t;
+            }
+            float *gate = randn(&r, (size_t)E * D, sd_in, 0);
+            for (long e = 0; e < E; e++) {
+                float a = E > 1 ? 1.0f - 2.0f * (float)perm[e] / (float)(E - 1) : 0.0f;
+                /* x = rmsnorm(h) has x.u ~ 0.7 sqrt(D), so this adds ~1.1a to
+                 * the logit against unit-variance noise from the random part */
+                for (long i = 0; i < D; i++) gate[e * D + i] += 1.6f / sqrtf((float)D) * a * u[i];
+            }
+            free(perm);
+            st_put(w, NM("mlp.gate.weight"), gate, 2, E, D, fp8);
+            if (router == 2)
+                st_put(w, NM("mlp.gate.e_score_correction_bias"), randn(&r, (size_t)E, 0.05f, 0), 1, E, 0, fp8);
+            for (long e = 0; e < E; e++) {
+                char en[200];
+                snprintf(en, sizeof en, "model.layers.%ld.mlp.experts.%ld.gate_proj.weight", l, e);
+                st_put(w, en, randn(&r, (size_t)de * D, sd_in, 0), 2, de, D, fp8);
+                snprintf(en, sizeof en, "model.layers.%ld.mlp.experts.%ld.up_proj.weight", l, e);
+                st_put(w, en, randn(&r, (size_t)de * D, sd_in, 0), 2, de, D, fp8);
+                snprintf(en, sizeof en, "model.layers.%ld.mlp.experts.%ld.down_proj.weight", l, e);
+                st_put(w, en, randn(&r, (size_t)D * de, 0.5f / sqrtf((float)de), 0), 2, D, de, fp8);
+            }
+            if (S > 0) {
+                st_put(w, NM("mlp.shared_expert.gate_proj.weight"), randn(&r, (size_t)S * D, sd_in, 0), 2, S, D, fp8);
+                st_put(w, NM("mlp.shared_expert.up_proj.weight"), randn(&r, (size_t)S * D, sd_in, 0), 2, S, D, fp8);
+                st_put(w, NM("mlp.shared_expert.down_proj.weight"), randn(&r, (size_t)D * S, 0.5f / sqrtf((float)S), 0),
+                       2, D, S, fp8);
+            }
         }
 #undef NM
     }
@@ -391,10 +405,12 @@ static int cmd_synth(int argc, char **argv) {
             "  \"vocab_size\": %ld,\n  \"hidden_size\": %ld,\n  \"num_hidden_layers\": %ld,\n"
             "  \"num_attention_heads\": %ld,\n  \"num_key_value_heads\": %ld,\n  \"head_dim\": %ld,\n"
             "  \"num_experts\": %ld,\n  \"num_experts_per_tok\": %ld,\n  \"moe_intermediate_size\": %ld,\n"
+            "  \"intermediate_size\": %ld,\n  \"first_k_dense_replace\": %ld,\n"
             "  \"shared_expert_intermediate_size\": %ld,\n  \"n_shared_experts\": %ld,\n"
             "  \"norm_topk_prob\": true,\n  \"scoring_func\": \"%s\",\n  \"routed_scaling_factor\": %s,\n"
             "  \"rms_norm_eps\": 1e-06,\n  \"rope_theta\": 1000000.0,\n",
-            V, D, L, H, KV, hd, E, K, de, S, shared, router == 2 ? "sigmoid" : "softmax",
+            V, D, L, H, KV, hd, E, K, de, dense_layers > 0 ? ff : de, dense_layers, S, shared,
+            router == 2 ? "sigmoid" : "softmax",
             router == 2 ? "2.5" : "1.0");
     if (yarn)
         fprintf(f,
@@ -410,9 +426,10 @@ static int cmd_synth(int argc, char **argv) {
             fp8 ? "true" : "false");
     if (fclose(f)) die("%s: write error", path);
     printf("tlmc: synthetic model in %s (%ld layers, d_model %ld, %ld experts top-%ld, d_expert %ld, "
-           "shared %ld, vocab %ld, %s router%s%s)\n",
+           "shared %ld, vocab %ld, %s router%s%s%s)\n",
            out, L, D, E, K, de, S, V, router == 2 ? "sigmoid" : "softmax",
-           fp8 ? ", FP8 E4M3 with 128x128 block scales" : "", yarn ? ", YaRN x4" : "");
+           fp8 ? ", FP8 E4M3 with 128x128 block scales" : "", yarn ? ", YaRN x4" : "",
+           dense_layers > 0 ? ", first_k_dense_replace" : "");
     return 0;
 }
 
@@ -734,6 +751,8 @@ typedef struct {
     tlm_st     *st;
     int         tie, has_qn, has_kn, has_bias, has_shared, has_sgate;
     const char *shared_prefix;   /* "shared_expert" or "shared_experts" */
+    int        *dense;           /* [n_layers] 1 = dense-FFN layer */
+    uint32_t    d_ffn;           /* dense-FFN intermediate width (intermediate_size) */
     uint8_t     src_sha[32], corp_sha[32], ref_sha[32];
     int         n_src_files;
     tlm_dtype   dense_dt, exp_dt;
@@ -837,9 +856,29 @@ static void pass_ingest(cc *c) {
     else if (!strcmp(sf, "softmax")) g->router = tlm_jbool(jget(r, "norm_topk_prob"), 0) ? 0 : 1;
     else die("ingest: scoring_func '%s' is not supported", sf);
     c->tie = tlm_jbool(jget(r, "tie_word_embeddings"), 0);
-    if (tlm_jint(jget(r, "decoder_sparse_step"), 1) != 1 || tlm_jlen(jget(r, "mlp_only_layers")) > 0 ||
-        tlm_jint(jget(r, "first_k_dense_replace"), 0) > 0)
-        die("ingest: dense FFN layers are not supported by the tlm-moe decoder yet");
+    if (tlm_jint(jget(r, "decoder_sparse_step"), 1) != 1)
+        die("ingest: decoder_sparse_step != 1 is not supported");
+    int64_t fk = tlm_jint(jget(r, "first_k_dense_replace"), 0);
+    const tlm_jval *mlo = jget(r, "mlp_only_layers");
+    size_t n_mlo = (mlo && mlo->type == TLM_J_ARR) ? mlo->u.arr.n : 0;
+    if (fk < 0 || (uint64_t)fk > (uint64_t)g->n_layers)
+        die("ingest: first_k_dense_replace %lld is out of range", (long long)fk);
+    c->dense = (int *)calloc(g->n_layers ? g->n_layers : 1, sizeof *c->dense);
+    if (!c->dense) die("out of memory");
+    for (int64_t l = 0; l < fk; l++) c->dense[(int)l] = 1;
+    for (size_t i = 0; i < n_mlo; i++) {
+        int64_t l = tlm_jint(tlm_jat(mlo, i), -1);
+        if (l < 0 || (uint64_t)l >= (uint64_t)g->n_layers)
+            die("ingest: mlp_only_layers[%zu] = %lld is out of range", i, (long long)l);
+        c->dense[(int)l] = 1;
+    }
+    int n_dense = 0;
+    for (uint32_t l = 0; l < g->n_layers; l++) n_dense += c->dense[l];
+    if (g->n_layers > 0 && n_dense == (int)g->n_layers)
+        die("ingest: every layer is dense; the tlm-moe decoder needs at least one routed layer");
+    c->d_ffn = (uint32_t)tlm_jint(jget(r, "intermediate_size"), g->d_expert);
+    if (n_dense > 0 && !c->d_ffn)
+        die("ingest: dense layers present but intermediate_size is missing");
     if (jget(r, "rope_scaling") && jget(r, "rope_scaling")->type == TLM_J_OBJ) {
         const tlm_jval *rs = jget(r, "rope_scaling");
         const char *rt = tlm_jstr(jget(rs, "rope_type"), tlm_jstr(jget(rs, "type"), "default"));
@@ -917,19 +956,25 @@ static void pass_ingest(cc *c) {
     sha_final(&all, c->src_sha);
     hex32(c->src_sha, hx);
 
-    /* tensor map (HF Qwen3-MoE / Qwen2-MoE / DeepSeek naming) */
-    char nm[256];
+    /* tensor map (HF Qwen3-MoE / Qwen2-MoE / DeepSeek naming). The mlp.*
+     * probes use the first routed layer, which may not be layer 0 under a
+     * dense prefix (a dense layer has no router, bias or shared expert). */
+    int moe0 = 0;
+    for (uint32_t l = 0; l < g->n_layers; l++) if (!c->dense[l]) { moe0 = (int)l; break; }
+    char nm[256], nm2[256];
     const tlm_st_tensor *t;
     t = tlm_st_find(c->st, "model.layers.0.self_attn.q_proj.bias");
     if (t) die("ingest: attention biases are not supported");
     c->has_qn = tlm_st_find(c->st, "model.layers.0.self_attn.q_norm.weight") != NULL;
     c->has_kn = tlm_st_find(c->st, "model.layers.0.self_attn.k_norm.weight") != NULL;
-    c->has_bias = tlm_st_find(c->st, "model.layers.0.mlp.gate.e_score_correction_bias") != NULL;
-    c->shared_prefix = tlm_st_find(c->st, "model.layers.0.mlp.shared_experts.gate_proj.weight") ? "shared_experts"
-                                                                                                 : "shared_expert";
-    snprintf(nm, sizeof nm, "model.layers.0.mlp.%s.gate_proj.weight", c->shared_prefix);
+    snprintf(nm2, sizeof nm2, "model.layers.%d.mlp.gate.e_score_correction_bias", moe0);
+    c->has_bias = tlm_st_find(c->st, nm2) != NULL;
+    snprintf(nm2, sizeof nm2, "model.layers.%d.mlp.shared_experts.gate_proj.weight", moe0);
+    c->shared_prefix = tlm_st_find(c->st, nm2) ? "shared_experts" : "shared_expert";
+    snprintf(nm, sizeof nm, "model.layers.%d.mlp.%s.gate_proj.weight", moe0, c->shared_prefix);
     c->has_shared = tlm_st_find(c->st, nm) != NULL;
-    c->has_sgate = tlm_st_find(c->st, "model.layers.0.mlp.shared_expert_gate.weight") != NULL;
+    snprintf(nm2, sizeof nm2, "model.layers.%d.mlp.shared_expert_gate.weight", moe0);
+    c->has_sgate = tlm_st_find(c->st, nm2) != NULL;
     if (c->has_shared && !g->d_shared) {
         t = tlm_st_find(c->st, nm);
         g->d_shared = (uint32_t)t->shape[0];
@@ -1015,21 +1060,30 @@ static void build_dense(cc *c, int l, void **pl, uint64_t *len) {
     dir_put(&d, "attn_k", fit_dtype(c->dense_dt, D), src_tensor(c, TN("self_attn.k_proj.weight"), KVd, D), KVd, D);
     dir_put(&d, "attn_v", fit_dtype(c->dense_dt, D), src_tensor(c, TN("self_attn.v_proj.weight"), KVd, D), KVd, D);
     dir_put(&d, "attn_o", fit_dtype(c->dense_dt, Q), src_tensor(c, TN("self_attn.o_proj.weight"), D, Q), D, Q);
-    /* router and its bias stay f32: small and sensitive (F-fwd-01, F-fwd-16) */
-    dir_put(&d, "router", TLM_DT_F32, src_tensor(c, TN("mlp.gate.weight"), g->n_experts, D), g->n_experts, D);
-    if (c->has_bias)
-        dir_put(&d, "router_bias", TLM_DT_F32, src_tensor(c, TN("mlp.gate.e_score_correction_bias"), g->n_experts, 0),
-                1, g->n_experts);
-    if (c->has_shared) {
-        int64_t S = g->d_shared;
-        snprintf(n[k], sizeof n[k], "model.layers.%d.mlp.%s.gate_proj.weight", l, c->shared_prefix);
-        dir_put(&d, "shared_gate", fit_dtype(c->dense_dt, D), src_tensor(c, n[k++], S, D), S, D);
-        snprintf(n[k], sizeof n[k], "model.layers.%d.mlp.%s.up_proj.weight", l, c->shared_prefix);
-        dir_put(&d, "shared_up", fit_dtype(c->dense_dt, D), src_tensor(c, n[k++], S, D), S, D);
-        snprintf(n[k], sizeof n[k], "model.layers.%d.mlp.%s.down_proj.weight", l, c->shared_prefix);
-        dir_put(&d, "shared_down", fit_dtype(c->dense_dt, S), src_tensor(c, n[k++], D, S), D, S);
-        if (c->has_sgate)
-            dir_put(&d, "shared_gate_inp", TLM_DT_F32, src_tensor(c, TN("mlp.shared_expert_gate.weight"), D, 0), 1, D);
+    if (c->dense[l]) {
+        /* Dense-FFN layer (first_k_dense_replace / mlp_only_layers): one
+         * resident SwiGLU block; no router, no experts, no shared expert. */
+        int64_t S = c->d_ffn;
+        dir_put(&d, "ffn_gate", fit_dtype(c->dense_dt, D), src_tensor(c, TN("mlp.gate_proj.weight"), S, D), S, D);
+        dir_put(&d, "ffn_up", fit_dtype(c->dense_dt, D), src_tensor(c, TN("mlp.up_proj.weight"), S, D), S, D);
+        dir_put(&d, "ffn_down", fit_dtype(c->dense_dt, S), src_tensor(c, TN("mlp.down_proj.weight"), D, S), D, S);
+    } else {
+        /* router and its bias stay f32: small and sensitive (F-fwd-01, F-fwd-16) */
+        dir_put(&d, "router", TLM_DT_F32, src_tensor(c, TN("mlp.gate.weight"), g->n_experts, D), g->n_experts, D);
+        if (c->has_bias)
+            dir_put(&d, "router_bias", TLM_DT_F32, src_tensor(c, TN("mlp.gate.e_score_correction_bias"), g->n_experts, 0),
+                    1, g->n_experts);
+        if (c->has_shared) {
+            int64_t S = g->d_shared;
+            snprintf(n[k], sizeof n[k], "model.layers.%d.mlp.%s.gate_proj.weight", l, c->shared_prefix);
+            dir_put(&d, "shared_gate", fit_dtype(c->dense_dt, D), src_tensor(c, n[k++], S, D), S, D);
+            snprintf(n[k], sizeof n[k], "model.layers.%d.mlp.%s.up_proj.weight", l, c->shared_prefix);
+            dir_put(&d, "shared_up", fit_dtype(c->dense_dt, D), src_tensor(c, n[k++], S, D), S, D);
+            snprintf(n[k], sizeof n[k], "model.layers.%d.mlp.%s.down_proj.weight", l, c->shared_prefix);
+            dir_put(&d, "shared_down", fit_dtype(c->dense_dt, S), src_tensor(c, n[k++], D, S), D, S);
+            if (c->has_sgate)
+                dir_put(&d, "shared_gate_inp", TLM_DT_F32, src_tensor(c, TN("mlp.shared_expert_gate.weight"), D, 0), 1, D);
+        }
     }
 #undef TN
     dir_done(&d, pl, len);
@@ -1104,6 +1158,7 @@ static void store_build(cc *c, const char *dir, const char *mpath, const tlm_dty
         if (tlm_writer_add(w, TLM_PK_DENSE, (uint16_t)l, 0, c->dense_dt, pl, len, NULL, 0, -1, &locs[n++]))
             die("%s", tlm_errmsg());
         tlm_free_aligned(pl);
+        if (c->dense[l]) continue;   /* dense layer: no EXPERT packets */
         for (uint32_t e = 0; e < g->n_experts; e++) {
             uint8_t *ep;
             uint32_t off[3];
@@ -1276,7 +1331,8 @@ static void label_experts(cc *c) {
     tlm_question q = {"expert.specialisation", TLM_Q_SCORE,
                       "How specialised is this expert's calibration input (byte classes)?",
                       SPEC_OPTS, SPEC_CRIT, 4, 0};
-    for (uint32_t l = 0; l < g->n_layers; l++)
+    for (uint32_t l = 0; l < g->n_layers; l++) {
+        if (c->dense[l]) continue;   /* no experts to classify */
         for (uint32_t e = 0; e < g->n_experts; e++) {
             int top;
             double h = class_entropy(&c->C, (int)l, (int)e, &top);
@@ -1286,6 +1342,7 @@ static void label_experts(cc *c) {
             decide_one(c, &q, h >= 0 ? f : f + 1, h >= 0 ? 3 : 2, &a);
             c->spec[(size_t)l * g->n_experts + e] = a.final_choice;
         }
+    }
 }
 
 /* ---- pass 3 ------------------------------------------------------------------------ */
@@ -1334,6 +1391,7 @@ static void pass_precision(cc *c, int *use_cand) {
         tlm_question q = {"expert.precision_tier", TLM_Q_CHOICE, "Which precision tier should this expert use?",
                           PREC_OPTS, PREC_CRIT, 3, 0};
         for (uint32_t l = 0; l < g->n_layers; l++) {
+            if (c->dense[l]) continue;   /* no experts to demote */
             double hmax = 0, smax = 0;
             for (uint32_t e = 0; e < g->n_experts; e++) {
                 if (heat_of(&c->C, (int)l, (int)e) > hmax) hmax = heat_of(&c->C, (int)l, (int)e);
@@ -1438,6 +1496,7 @@ static void pass_prune(cc *c, rtm *base) {
     if (!cands) die("out of memory");
     int nc = 0;
     for (int l = 0; l < L; l++) {
+        if (c->dense[l]) continue;   /* dense layers have no experts to prune */
         double smax = 0;
         for (int e = 0; e < E; e++) if (saliency_of(&c->C, l, e) > smax) smax = saliency_of(&c->C, l, e);
         for (int e = 0; e < E; e++) {
@@ -1462,7 +1521,9 @@ static void pass_prune(cc *c, rtm *base) {
     }
     qsort(cands, (size_t)nc, sizeof *cands, cand_cmp);
 
-    int total = L * E, accepted = 0, prev_got = -1;
+    int n_dense_l = 0;
+    for (int l = 0; l < L; l++) n_dense_l += c->dense[l];
+    int total = (L - n_dense_l) * E, accepted = 0, prev_got = -1;
     int pct = (int)floor(ratio * 100.0 + 1e-9);
     uint8_t *mask = (uint8_t *)calloc(nx, 1);
     int *per = (int *)calloc((size_t)L, sizeof(int));
@@ -1820,6 +1881,16 @@ static char *build_report(cc *c, const tlm_manifest *m) {
     tlm_jw_int(&w, "top_k", g->top_k);
     tlm_jw_int(&w, "d_expert", g->d_expert);
     tlm_jw_int(&w, "d_shared", g->d_shared);
+    if (c->dense) {
+        int n_dense = 0;
+        for (uint32_t l = 0; l < g->n_layers; l++) n_dense += c->dense[l];
+        if (n_dense) {
+            tlm_jw_int(&w, "d_ffn", (int64_t)c->d_ffn);
+            tlm_jw_begin_arr(&w, "dense_layers");
+            for (uint32_t l = 0; l < g->n_layers; l++) if (c->dense[l]) tlm_jw_int(&w, NULL, (int64_t)l);
+            tlm_jw_end_arr(&w);
+        }
+    }
     tlm_jw_str(&w, "router", g->router == 2 ? "sigmoid+bias" : g->router == 1 ? "softmax-topk" : "softmax-topk-renorm");
     if (g->rope_scale) {
         tlm_jw_key_obj(&w, "rope");
@@ -1855,6 +1926,9 @@ static char *build_report(cc *c, const tlm_manifest *m) {
     tlm_jw_num(&w, "cap", round6(c->prune_cap));
     tlm_jw_num(&w, "ratio", round6(c->prune_ratio));
     tlm_jw_int(&w, "pruned", c->n_pruned);
+    int n_dense_pr = 0;
+    for (uint32_t l = 0; l < g->n_layers; l++) n_dense_pr += c->dense ? c->dense[l] : 0;
+    tlm_jw_int(&w, "total", (int64_t)((int)g->n_layers - n_dense_pr) * (int)g->n_experts);
     tlm_jw_num(&w, "gate_top1", c->profile == PROF_EXACT ? 1.0 : c->gate);
     fprintf(f, ",\"attempts\":%s", c->attempts_json ? c->attempts_json : "[]");
     tlm_jw_end_obj(&w);
@@ -1921,6 +1995,7 @@ static char *build_report(cc *c, const tlm_manifest *m) {
     tlm_jw_begin_arr(&w, "experts");
     for (uint32_t l = 0; l < g->n_layers; l++) {
         tlm_jw_begin_arr(&w, NULL);
+        if (c->dense[l]) { tlm_jw_end_arr(&w); continue; }   /* dense layer: no experts */
         for (int e = 0; e < E; e++) {
             size_t ix = (size_t)l * E + e;
             int top;
@@ -2122,6 +2197,7 @@ static int cmd_compile(int argc, char **argv) {
     tokset_free(&c->cal);
     tokset_free(&c->ev);
     free(c->ex_dt);
+    free(c->dense);
     free(c->pruned);
     free(c->protect);
     free(c->exclude);
@@ -2177,8 +2253,9 @@ static void print_summary(const tlm_manifest *m, FILE *out) {
         long long np = tlm_jint(jget(pr, "pruned"), 0);
         if (!strcmp(m->profile, "exact")) fprintf(out, "prune       none (exact profile)\n");
         else {
-            fprintf(out, "prune       %lld of %u experts (%.0f%% of cap %.0f%%), content.default=%s\n", np,
-                    g->n_layers * g->n_experts, 100 * tlm_jnum(jget(pr, "ratio"), 0), 100 * tlm_jnum(jget(pr, "cap"), 0),
+            long long pt = tlm_jint(jget(pr, "total"), (int64_t)g->n_layers * g->n_experts);
+            fprintf(out, "prune       %lld of %lld experts (%.0f%% of cap %.0f%%), content.default=%s\n", np, pt,
+                    100 * tlm_jnum(jget(pr, "ratio"), 0), 100 * tlm_jnum(jget(pr, "cap"), 0),
                     tlm_jstr(jget(pr, "content_default"), "standard"));
             const tlm_jval *at = jget(pr, "attempts");
             for (size_t i = 0; i < tlm_jlen(at); i++) {
@@ -2350,7 +2427,7 @@ static void usage(FILE *f) {
             "tlmc %s - tierlm model compiler\n"
             "  tlmc synth   --out DIR [--layers N] [--d-model N] [--heads N] [--kv-heads N] [--head-dim N]\n"
             "               [--experts N] [--top-k N] [--d-expert N] [--shared N] [--vocab N] [--seed N]\n"
-            "               [--router softmax|sigmoid] [--qk-norm yes|no]\n"
+            "               [--router softmax|sigmoid] [--qk-norm yes|no] [--dense-layers N] [--dense-ffn N]\n"
             "  tlmc compile SRC --out MANIFEST --drives d1,d2,... [--experts q6_k] [--dense q8_0]\n"
             "               [--profile exact|balanced|aggressive] [--replicas auto|none] [--corpus FILE]\n"
             "               [--eval FILE] [--etc DIR] [--report] [--threads N] [--calib-tokens N]\n"

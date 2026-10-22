@@ -35,6 +35,7 @@ static void rm_rf(const char *p) { nftw(p, rm_cb, 16, FTW_DEPTH | FTW_PHYS); }
 /* ---- synthetic model -------------------------------------------------------- */
 typedef struct {
     int L, D, H, KV, hd, V, E, K, de, ds, router, qk_norm, n_drives, replicas;
+    int n_dense, d_ffn;        /* first n_dense layers are dense-FFN (width d_ffn) */
     float routed_scale;
     tlm_dtype dense_dt;
     tlm_dtype expert_dt[3];   /* expert e uses expert_dt[e % 3] */
@@ -48,6 +49,7 @@ typedef struct {
 typedef struct {   /* f32 copies (dequantised) for the reference */
     float *attn_norm, *ffn_norm, *q_norm, *k_norm, *q, *k, *v, *o, *router, *rbias;
     float *sg, *su, *sd;
+    float *fg, *fu, *fd;      /* dense FFN: [d_ffn*D], [d_ffn*D], [D*d_ffn] */
     float *eg, *eu, *ed;     /* [E][de*D], [E][de*D], [E][D*de] */
 } ref_layer;
 
@@ -131,18 +133,28 @@ static int build(synth *S, const spec *sp, const char *name) {
         dir_add(&d, "attn_k", sp->dense_dt, R->k, KV * hd, D);
         dir_add(&d, "attn_v", sp->dense_dt, R->v, KV * hd, D);
         dir_add(&d, "attn_o", sp->dense_dt, R->o, D, H * hd);
-        dir_add(&d, "router", TLM_DT_F32, R->router, E, D);
-        if (sp->router == 2) {
-            R->rbias = rnd((size_t)E, 0.3f, 0);
-            dir_add(&d, "router_bias", TLM_DT_F32, R->rbias, 1, E);
-        }
-        if (ds > 0) {
-            R->sg = rnd((size_t)ds * D, 1.7f * sd_in, 0);
-            R->su = rnd((size_t)ds * D, 1.7f * sd_in, 0);
-            R->sd = rnd((size_t)D * ds, 0.8f / sqrtf((float)ds), 0);
-            dir_add(&d, "shared_gate", sp->dense_dt, R->sg, ds, D);
-            dir_add(&d, "shared_up", sp->dense_dt, R->su, ds, D);
-            dir_add(&d, "shared_down", sp->dense_dt, R->sd, D, ds);
+        if (l < sp->n_dense) {
+            /* Dense-FFN layer: resident SwiGLU block, no router or experts */
+            R->fg = rnd((size_t)sp->d_ffn * D, 1.7f * sd_in, 0);
+            R->fu = rnd((size_t)sp->d_ffn * D, 1.7f * sd_in, 0);
+            R->fd = rnd((size_t)D * sp->d_ffn, 0.8f / sqrtf((float)sp->d_ffn), 0);
+            dir_add(&d, "ffn_gate", sp->dense_dt, R->fg, sp->d_ffn, D);
+            dir_add(&d, "ffn_up", sp->dense_dt, R->fu, sp->d_ffn, D);
+            dir_add(&d, "ffn_down", sp->dense_dt, R->fd, D, sp->d_ffn);
+        } else {
+            dir_add(&d, "router", TLM_DT_F32, R->router, E, D);
+            if (sp->router == 2) {
+                R->rbias = rnd((size_t)E, 0.3f, 0);
+                dir_add(&d, "router_bias", TLM_DT_F32, R->rbias, 1, E);
+            }
+            if (ds > 0) {
+                R->sg = rnd((size_t)ds * D, 1.7f * sd_in, 0);
+                R->su = rnd((size_t)ds * D, 1.7f * sd_in, 0);
+                R->sd = rnd((size_t)D * ds, 0.8f / sqrtf((float)ds), 0);
+                dir_add(&d, "shared_gate", sp->dense_dt, R->sg, ds, D);
+                dir_add(&d, "shared_up", sp->dense_dt, R->su, ds, D);
+                dir_add(&d, "shared_down", sp->dense_dt, R->sd, D, ds);
+            }
         }
         void *pl;
         uint64_t plen;
@@ -152,6 +164,7 @@ static int build(synth *S, const spec *sp, const char *name) {
         rc = tlm_writer_add(w, TLM_PK_DENSE, (uint16_t)l, 0, sp->dense_dt, pl, plen, NULL,
                             l % sp->n_drives, -1, &locs[nl++]);
         tlm_free_aligned(pl);
+        if (l < sp->n_dense) continue;   /* dense layer: DENSE packet only */
         /* experts: gate | up | down, 64-byte aligned sub-offsets */
         R->eg = (float *)malloc(sizeof(float) * (size_t)E * de * D);
         R->eu = (float *)malloc(sizeof(float) * (size_t)E * de * D);
@@ -248,7 +261,8 @@ static void synth_free(synth *S) {
         ref_layer *R = &S->Lw[l];
         free(R->attn_norm); free(R->ffn_norm); free(R->q_norm); free(R->k_norm);
         free(R->q); free(R->k); free(R->v); free(R->o); free(R->router); free(R->rbias);
-        free(R->sg); free(R->su); free(R->sd); free(R->eg); free(R->eu); free(R->ed);
+        free(R->sg); free(R->su); free(R->sd); free(R->fg); free(R->fu); free(R->fd);
+        free(R->eg); free(R->eu); free(R->ed);
     }
     free(S->Lw);
     free(S->out_norm); free(S->lm_head); free(S->embd);
@@ -320,7 +334,9 @@ static void ref_step(ref_state *st, int token, float *logits, const uint8_t *mas
     double *q = calloc((size_t)H * hd, sizeof(double)), *k = calloc((size_t)KV * hd, sizeof(double));
     double *v = calloc((size_t)KV * hd, sizeof(double)), *att = calloc((size_t)H * hd, sizeof(double));
     double *o = calloc((size_t)D, sizeof(double)), *lg = calloc((size_t)E, sizeof(double));
-    double *gg = calloc((size_t)(de > ds ? de : ds), sizeof(double)), *uu = calloc((size_t)(de > ds ? de : ds), sizeof(double));
+    int gsz = de > ds ? de : ds;
+    if (sp->d_ffn > gsz) gsz = sp->d_ffn;
+    double *gg = calloc((size_t)gsz, sizeof(double)), *uu = calloc((size_t)gsz, sizeof(double));
     double *sc = calloc((size_t)pos + 1, sizeof(double));
     for (int i = 0; i < D; i++) h[i] = S->embd[(size_t)token * D + i];
     for (int l = 0; l < sp->L; l++) {
@@ -355,6 +371,20 @@ static void ref_step(ref_state *st, int token, float *logits, const uint8_t *mas
         r_mv(o, R->o, att, D, H * hd);
         for (int i = 0; i < D; i++) h[i] += o[i];
         r_rms(x, h, R->ffn_norm, D);
+        if (l < sp->n_dense) {
+            /* Dense-FFN layer: one resident SwiGLU block, no routing */
+            int df = sp->d_ffn;
+            r_mv(gg, R->fg, x, df, D);
+            r_mv(uu, R->fu, x, df, D);
+            for (int i = 0; i < df; i++) gg[i] = r_silu(gg[i]) * uu[i];
+            for (int i = 0; i < D; i++) {
+                double s = 0;
+                for (int j = 0; j < df; j++) s += (double)R->fd[(size_t)i * df + j] * gg[j];
+                o[i] = s;
+            }
+            for (int i = 0; i < D; i++) h[i] += o[i];
+            continue;
+        }
         r_mv(lg, R->router, x, E, D);
         /* routing */
         const uint8_t *mk = mask ? mask + (size_t)l * E : NULL;
@@ -743,6 +773,119 @@ static void test_invariance(void) {
     synth_free(&S);
 }
 
+static void check_dense_reference(int n_dense, int d_ffn) {
+    spec s;
+    memset(&s, 0, sizeof s);
+    s.L = 3; s.D = 64; s.H = 4; s.KV = 2; s.hd = 16; s.V = 50; s.E = 6; s.K = 2; s.de = 32;
+    s.ds = 32; s.router = 0; s.qk_norm = 1; s.n_drives = 2; s.routed_scale = 1.0f;
+    s.n_dense = n_dense; s.d_ffn = d_ffn;
+    s.dense_dt = TLM_DT_F32;
+    s.expert_dt[0] = s.expert_dt[1] = s.expert_dt[2] = TLM_DT_F32;
+    s.seed = 300u + (unsigned)n_dense * 17u + (unsigned)d_ffn;
+    synth S;
+    char name[32];
+    snprintf(name, sizeof name, "denseref%d_%d", n_dense, d_ffn);
+    CHECK_EQ_INT(build(&S, &s, name), 0);
+    rt r;
+    rt_cfg c = {2, 4, 1, 0.0, 0};
+    if (rt_open(&r, &S, &c)) { fprintf(stderr, "  open: %s\n", tlm_errmsg()); CHECK(0); synth_free(&S); return; }
+    tlm_kv *kv = tlm_kv_new(r.mdl, 32);
+    ref_state st = {&S, calloc((size_t)s.L * 256 * s.KV * s.hd, sizeof(double)),
+                    calloc((size_t)s.L * 256 * s.KV * s.hd, sizeof(double)), 0};
+    float lg[64], lr[64];
+    const int toks[8] = {1, 7, 49, 0, 22, 7, 7, 3};
+    double worst = 0;
+    for (int i = 0; i < 8; i++) {
+        CHECK_EQ_INT(tlm_model_step(r.mdl, kv, toks[i], lg), 0);
+        ref_step(&st, toks[i], lr, NULL);
+        for (int t = 0; t < s.V; t++) {
+            double d = fabs((double)lg[t] - (double)lr[t]) / (1.0 + fabs((double)lr[t]));
+            if (d > worst) worst = d;
+        }
+    }
+    if (worst >= 1e-4) fprintf(stderr, "  dense %d/%d: worst relative logit error %g\n", n_dense, d_ffn, worst);
+    CHECK(worst < 1e-4);
+    free(st.K);
+    free(st.Vc);
+    tlm_kv_free(kv);
+    rt_close(&r);
+    synth_free(&S);
+}
+
+static void test_dense_prefix(void) {
+    /* a dense prefix must match the naive reference (F-fwd-01, F-fwd-18) */
+    check_dense_reference(1, 32);
+    check_dense_reference(2, 48);
+    /* a quantised dense prefix must be bit-identical across cache sizes,
+     * thread counts and kernel tiers (P-43/P-34), like the all-MoE model */
+    spec s = quant_spec();
+    s.n_dense = 1;
+    s.d_ffn = 128;
+    s.seed = 2024;
+    synth S;
+    CHECK_EQ_INT(build(&S, &s, "densinv"), 0);
+    int V = s.V;
+    rt r;
+    trace base;
+    memset(&base, 0, sizeof base);
+    rt_cfg c0 = {1, 64, 0, 0.0, 0};
+    if (rt_open(&r, &S, &c0)) { fprintf(stderr, "  open: %s\n", tlm_errmsg()); CHECK(0); synth_free(&S); return; }
+    CHECK_EQ_INT(run_trace(&r, V, &base), 0);
+    rt_close(&r);
+    int n_finite = 0;
+    for (int i = 0; i < NSTEP * V; i++) n_finite += isfinite(base.logits[i]) != 0;
+    CHECK_EQ_INT(n_finite, NSTEP * V);
+    const rt_cfg cfgs[] = {
+        {2, 64, 0, 0.0, 0},              /* threads */
+        {4, 64, 0, 0.0, 0},
+        {3, 64, 1, 0.5, 0},              /* resident + pinned + prefetch */
+        {1, (uint64_t)s.K, 0, 0.0, 0},   /* minimal cache: top_k slots */
+        {4, (uint64_t)s.K, 1, 0.0, 0},   /* minimal cache with prefetch */
+        {2, (uint64_t)s.K + 2, 1, 0.0, 6}, /* small cache, aggressive lookahead */
+        {2, 9, 1, 0.3, 0},               /* partial cache with pins */
+    };
+    for (size_t i = 0; i < sizeof cfgs / sizeof cfgs[0]; i++) {
+        trace t;
+        memset(&t, 0, sizeof t);
+        if (rt_open(&r, &S, &cfgs[i])) {
+            fprintf(stderr, "  dense cfg %zu open: %s\n", i, tlm_errmsg());
+            CHECK(0);
+            rt_close(&r);
+            continue;
+        }
+        CHECK_EQ_INT(run_trace(&r, V, &t), 0);
+        if (!same_trace(&base, &t, V)) fprintf(stderr, "  dense cfg %zu differs\n", i);
+        CHECK(same_trace(&base, &t, V));
+        tlm_store_stats ss;
+        tlm_store_get_stats(r.store, &ss);
+        CHECK_EQ_INT(ss.in_use, 0);   /* every acquire was released */
+        rt_close(&r);
+        free(t.logits);
+    }
+    const char *tiers[] = {"scalar", "avx2", "avx512"};
+    for (int i = 0; i < 3; i++) {
+        tlm_cpu_force(tiers[i]);
+        tlm_quant_init();
+        if (strcmp(tlm_quant_tier(), tiers[i]) != 0) {
+            printf("  (tier %s not available here, got %s)\n", tiers[i], tlm_quant_tier());
+            continue;
+        }
+        trace t;
+        memset(&t, 0, sizeof t);
+        rt_cfg c = {2, 4, 1, 0.0, 0};
+        if (rt_open(&r, &S, &c)) { CHECK(0); rt_close(&r); continue; }
+        CHECK_EQ_INT(run_trace(&r, V, &t), 0);
+        if (!same_trace(&base, &t, V)) fprintf(stderr, "  dense tier %s differs\n", tiers[i]);
+        CHECK(same_trace(&base, &t, V));
+        rt_close(&r);
+        free(t.logits);
+    }
+    tlm_cpu_force("auto");
+    tlm_quant_init();
+    free(base.logits);
+    synth_free(&S);
+}
+
 static void test_prefill_equals_steps(void) {
     spec s = quant_spec();
     s.seed = 11;
@@ -1044,6 +1187,7 @@ int main(void) {
     RUN(test_yarn_table);
     RUN(test_yarn_reference);
     RUN(test_invariance);
+    RUN(test_dense_prefix);
     RUN(test_prefill_equals_steps);
     RUN(test_hook_and_mask);
     RUN(test_sampler);
