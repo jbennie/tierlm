@@ -13,10 +13,10 @@
 
 #define MK_IM_S  "<|im_start|>"
 #define MK_IM_E  "<|im_end|>"
-#define MK_TH    "<|think|>"
-#define MK_THS   "<|/think|>"
-#define MK_TR    "<|tool_response|>"
-#define MK_TRS   "<|/tool_response|>"
+#define MK_TH    "<think>"
+#define MK_THS   "\x3c/think\x3e"         /* no pipes: Qwen3 think-close marker */
+#define MK_TR    "\x3ctool_response\x3e"
+#define MK_TRS   "\x3c/tool_response\x3e"
 
 typedef struct {
     int *v;
@@ -92,12 +92,14 @@ int tlm_qwen3_chat_render(const tlm_bpe *b, const tlm_chat_msg *msgs, int nmsgs,
 
     for (int idx = 0; idx < nmsgs && !o.err; idx++) {
         const tlm_chat_msg *m = &msgs[idx];
-        if (strcmp(m->role, "user") == 0 ||
-            (strcmp(m->role, "system") == 0 && idx != 0)) {
+        if (idx == 0 && strcmp(m->role, "system") == 0)
+            continue;   /* rendered in the prologue */
+        if (strcmp(m->role, "user") == 0 || strcmp(m->role, "system") == 0) {
             if (ob_push(&o, id_im_s) || ob_enc(&o, b, m->role, 0) || ob_enc(&o, b, "\n", 1) ||
                 ob_enc(&o, b, m->content, m->content_len) ||
                 ob_push(&o, id_im_e) || ob_enc(&o, b, "\n", 1))
                 return -1;
+        } else if (strcmp(m->role, "assistant") == 0) {
             /* reasoning split */
             const char *r = NULL;
             size_t rlen = 0;
@@ -108,15 +110,19 @@ int tlm_qwen3_chat_render(const tlm_bpe *b, const tlm_chat_msg *msgs, int nmsgs,
                 r = m->reasoning;
                 rlen = m->reasoning_len ? m->reasoning_len : strlen(r);
             } else if (strchr(c, '<') != NULL) {
-                const char *ths = strstr(c, MK_THS);
-                if (ths && ths < cend) {
+                const char *ths1 = strstr(c, MK_THS);
+                if (ths1 && ths1 < cend) {
+                    const char *ths = ths1;
+                    for (const char *p = strstr(ths1 + 1, MK_THS); p && p < cend;
+                         p = strstr(p + 1, MK_THS))
+                        ths = p;
                     /* r = c before first THS, rstrip "\n"; within that prefix,
-                     * after the last TH, lstrip "\n"; c = after first THS,
+                     * after the last TH, lstrip "\n"; c = after last THS,
                      * lstrip "\n" */
-                    size_t pre = (size_t)(ths - c);
+                    size_t pre = (size_t)(ths1 - c);
                     while (pre > 0 && c[pre - 1] == '\n') pre--;
                     const char *th_last = NULL;
-                    for (const char *p = strstr(c, MK_TH); p && p < ths; p = strstr(p + 1, MK_TH))
+                    for (const char *p = strstr(c, MK_TH); p && p < ths1; p = strstr(p + 1, MK_TH))
                         th_last = p;
                     if (th_last) {
                         r = th_last + strlen(MK_TH);
