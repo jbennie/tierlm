@@ -188,8 +188,39 @@ static void test_alt_file_selection(void) {
     tlm_io_stats(io, 0, &st0);
     tlm_io_stats(io, 1, &st1);
     CHECK_EQ_INT(st0.reads + st1.reads, N);
-    CHECK(st0.reads > 0);
-    CHECK(st1.reads > 0);   /* the shorter queue took part of the load (P-31) */
+    CHECK(st0.reads > 0);   /* ties go to the primary, so it always serves at least one */
+
+    /* P-31 decision, deterministically: tlm_io_submit counts the new job in
+     * the file's load before returning, so while a near-full-file read
+     * occupies f0, the next request naming both copies must go to idle f1. */
+    waiter_init(&w);
+    job ja, jb;
+    memset(&ja, 0, sizeof ja);
+    ja.w = &w;
+    ja.len = FILE_BYTES - 8192;
+    ja.off = 0;
+    ja.mem = ja.buf = (uint8_t *)tlm_alloc_aligned(ja.len, 4096);
+    atomic_init(&ja.calls, 0);
+    memset(&jb, 0, sizeof jb);
+    jb.w = &w;
+    jb.len = 4096;
+    jb.off = 4096;
+    jb.mem = jb.buf = (uint8_t *)tlm_alloc_aligned(4096, 4096);
+    atomic_init(&jb.calls, 0);
+    CHECK_EQ_INT(tlm_io_submit(io, 0, ja.off, -1, 0, ja.buf, ja.len, on_done, &ja), 0);
+    tlm_io_file_stats s0x, s1a, s1b;
+    tlm_io_stats(io, 0, &s0x);
+    CHECK(s0x.queued > 0);   /* load is counted at submit time, so it holds now */
+    tlm_io_stats(io, 1, &s1a);
+    CHECK_EQ_INT(tlm_io_submit(io, 0, jb.off, 1, jb.off + SHIFT, jb.buf, jb.len, on_done, &jb), 0);
+    waiter_wait(&w, 2);
+    CHECK_EQ_INT(w.errors, 0);
+    CHECK(check_bytes(ja.buf, ja.off, ja.len));
+    CHECK(check_bytes(jb.buf, jb.off, jb.len));
+    tlm_io_stats(io, 1, &s1b);
+    CHECK_EQ_INT(s1b.reads - s1a.reads, 1);   /* the probe went to the idle copy (P-31) */
+    tlm_free_aligned(ja.mem);
+    tlm_free_aligned(jb.mem);
 
     /* alt == file means "no replica". */
     waiter_init(&w);
