@@ -117,6 +117,22 @@ NP=$(sed -n 's/^prune  *\([0-9][0-9]*\) of .*/\1/p' "$T/bal.log")
 [ -n "$NP" ] && [ "$NP" -gt 0 ] || fail "balanced compile pruned nothing"
 grep -q "attempt .*-> pass" "$T/bal.log" || fail "no passing gate attempt"
 
+step "compile with a BPE tokenizer.json: corpus tokenised with the model's own BPE"
+run_logged "$T/synthb.log" "$B/tlmc" synth --out "$T/src-bpe" --layers 2 --experts 8 --top-k 2 --shared 1 --seed 4
+cp tests/fixtures/tiny_bpe_tokenizer.json "$T/src-bpe/tokenizer.json"
+printf 'aa YY aa YY end of line\n' > "$T/bpe-corpus.txt"
+run_logged "$T/bpe.log" "$B/tlmc" compile "$T/src-bpe" --out "$T/models/bpe.tlmm" --drives "$T/nvme0" \
+    --profile exact --replicas auto --corpus "$T/bpe-corpus.txt" --calib-tokens 4096
+run_logged "$T/bpe.json" "$B/tlmc" report "$T/models/bpe.tlmm" --json
+grep -q '"tokenizer":"bpe"' "$T/bpe.json" || fail "BPE tokenizer.json was not used for the corpus"
+run_logged "$T/byte.log" "$B/tlmc" compile "$T/src" --out "$T/models/byte.tlmm" --drives "$T/nvme0" \
+    --profile exact --replicas auto --corpus "$T/bpe-corpus.txt" --calib-tokens 4096
+run_logged "$T/byte.json" "$B/tlmc" report "$T/models/byte.tlmm" --json
+grep -q '"tokenizer":"byte"' "$T/byte.json" || fail "synthetic model (no tokenizer.json) should stay byte-level"
+BT=$(sed -n 's/.*"calibration":{"tokens":\([0-9]*\).*/\1/p' "$T/bpe.json")
+YT=$(sed -n 's/.*"calibration":{"tokens":\([0-9]*\).*/\1/p' "$T/byte.json")
+[ -n "$BT" ] && [ -n "$YT" ] && [ "$BT" -lt "$YT" ] || fail "BPE corpus ($BT tokens) should be fewer than byte-level ($YT tokens)"
+
 step "report + atlas"
 run_logged "$T/report.out" "$B/tlmc" report "$T/models/bal.tlmm"
 grep -q "^prune  *$NP of" "$T/report.out" || fail "report disagrees with compile"

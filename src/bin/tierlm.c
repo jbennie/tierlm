@@ -4,7 +4,7 @@
  *                 [--top-p P] [--min-p P] [--seed N] [--cache SIZE] [--threads N]
  *                 [--io pread|io_uring] [--direct yes|no] [--prefetch router|off]
  *                 [--pin-frac F] [--warm FILE] [--kernel scalar|avx2|avx512]
- *                 [--stats] [--etc DIR] [--print-tokens]
+ *                 [--stats | --stats-json] [--etc DIR] [--print-tokens]
  *   tierlm bench  MANIFEST [--prompt-len N] [-n N] [runtime flags as for run]
  *   tierlm config show [--origin] [--etc DIR]
  *   tierlm config check [--etc DIR]
@@ -82,7 +82,7 @@ static void fmt_bytes(uint64_t b, char *out, size_t cap) {
 /* ---- options shared by run and bench ------------------------------------- */
 typedef struct {
     const char *manifest, *prompt, *tokens, *etc, *warm, *kernel, *tokenizer;
-    int         n, stats, print_tokens, prompt_len;
+    int         n, stats, stats_json, print_tokens, prompt_len;
     int         have_temp, have_seed;
     double      temp, top_p, min_p;
     uint64_t    seed;
@@ -137,6 +137,7 @@ static void parse_opts(opts *o, int argc, char **argv, int bench) {
         else if (!strcmp(a, "--min-p")) o->min_p = frac_arg(need(argc, argv, &i), a, 0, 1);
         else if (!strcmp(a, "--seed")) { o->seed = (uint64_t)num_arg(need(argc, argv, &i), a, 0, LONG_MAX); o->have_seed = 1; }
         else if (!strcmp(a, "--stats")) o->stats = 1;
+        else if (!strcmp(a, "--stats-json")) o->stats_json = 1;
         else if (!strcmp(a, "--print-tokens")) o->print_tokens = 1;
         else if (!strcmp(a, "--warm")) o->warm = need(argc, argv, &i);
         else if (!strcmp(a, "--kernel")) o->kernel = need(argc, argv, &i);
@@ -341,6 +342,43 @@ static void print_stats(runtime *r, FILE *f, int n_prompt, int n_gen, double pre
     }
 }
 
+/* Machine-readable: one JSON line of raw stats (bytes and nanoseconds as
+ * integers) for tools/m2_eval.sh to compute the M2 gate. */
+static void print_stats_json(runtime *r, FILE *f, int n_prompt, int n_gen, double prefill_s, double decode_s) {
+    tlm_model_stats ms;
+    tlm_model_get_stats(r->mdl, &ms);
+    tlm_store_stats ss;
+    tlm_store_get_stats(r->st, &ss);
+    uint64_t acc = ss.hits + ss.misses;
+    double per = ms.tokens ? 1e-6 / (double)ms.tokens : 0;
+    fprintf(f, "{\"prompt\":%d,\"generated\":%d,\"prefill_tok_s\":%.3f,\"decode_tok_s\":%.3f,",
+            n_prompt, n_gen, prefill_s > 0 ? (double)n_prompt / prefill_s : 0.0,
+            decode_s > 0 && n_gen > 1 ? (double)(n_gen - 1) / decode_s : 0.0);
+    fprintf(f, "\"per_token_ms\":{\"attention\":%.3f,\"moe\":%.3f,\"expert_wait\":%.3f,\"other\":%.3f},",
+            (double)ms.attn_ns * per, (double)ms.moe_ns * per, (double)ms.expert_wait_ns * per,
+            (double)ms.other_ns * per);
+    fprintf(f, "\"cache\":{\"slots\":%d,\"slot_bytes\":%llu,\"budget_bytes\":%llu,\"expert_total_bytes\":%llu,"
+               "\"pinned\":%d,\"pin_frac\":%.4f},",
+            ss.slots, (unsigned long long)r->slot, (unsigned long long)r->budget,
+            (unsigned long long)r->expert_total, ss.pinned, r->pin_frac);
+    fprintf(f, "\"store\":{\"hits\":%llu,\"misses\":%llu,\"hit_rate\":%.4f,\"evictions\":%llu,\"bytes_read\":%llu,"
+               "\"wait_ns\":%llu,\"prefetch_issued\":%llu,\"prefetch_used\":%llu,\"prefetch_dropped\":%llu},",
+            (unsigned long long)ss.hits, (unsigned long long)ss.misses, acc ? 100.0 * ss.hits / acc : 100.0,
+            (unsigned long long)ss.evictions, (unsigned long long)ss.bytes_read, (unsigned long long)ss.wait_ns,
+            (unsigned long long)ss.prefetch_issued, (unsigned long long)ss.prefetch_used,
+            (unsigned long long)ss.prefetch_dropped);
+    fprintf(f, "\"io\":{\"backend\":\"%s\",\"missing\":%s,\"drives\":[", tlm_io_backend_name(r->io),
+            r->missing ? "true" : "false");
+    for (uint32_t d = 0; d < r->m.n_drives; d++) {
+        tlm_io_file_stats is;
+        tlm_io_stats(r->io, (int)d, &is);
+        fprintf(f, "%s{\"reads\":%llu,\"bytes\":%llu,\"busy_ns\":%llu}", d ? "," : "",
+                (unsigned long long)is.reads, (unsigned long long)is.bytes, (unsigned long long)is.busy_ns);
+    }
+    fprintf(f, "]},\"load_s\":%.3f,\"threads\":%d,\"kernel\":\"%s\"}\n", r->load_s, r->threads,
+            tlm_quant_tier());
+}
+
 /* ---- prompt ------------------------------------------------------------------- */
 static int *make_prompt(const opts *o, int V, const tlm_bpe *tok, int *n) {
     if (o->tokens) {
@@ -461,7 +499,8 @@ static int cmd_run(int argc, char **argv) {
     }
     putchar('\n');
     fflush(stdout);
-    if (o.stats) print_stats(&r, stderr, np, gen, (double)(t1 - t0) * 1e-9, (double)(t2 - t1) * 1e-9);
+    if (o.stats_json) print_stats_json(&r, stderr, np, gen, (double)(t1 - t0) * 1e-9, (double)(t2 - t1) * 1e-9);
+    else if (o.stats) print_stats(&r, stderr, np, gen, (double)(t1 - t0) * 1e-9, (double)(t2 - t1) * 1e-9);
     free(lg);
     free(prompt);
     tlm_kv_free(kv);
@@ -554,9 +593,12 @@ static int cmd_bench(int argc, char **argv) {
     }
     uint64_t t2 = tlm_now_ns();
     double ps = (double)(t1 - t0) * 1e-9, ds = (double)(t2 - t1) * 1e-9;
-    printf("bench %s: prompt %d tokens in %.3f s (%.1f tok/s), decode %d tokens in %.3f s (%.1f tok/s)\n",
-           r.m.name, np, ps, ps > 0 ? np / ps : 0.0, gen, ds, ds > 0 && gen > 1 ? (gen - 1) / ds : 0.0);
-    print_stats(&r, stdout, np, gen, ps, ds);
+    if (o.stats_json) print_stats_json(&r, stdout, np, gen, ps, ds);
+    else {
+        printf("bench %s: prompt %d tokens in %.3f s (%.1f tok/s), decode %d tokens in %.3f s (%.1f tok/s)\n",
+               r.m.name, np, ps, ps > 0 ? np / ps : 0.0, gen, ds, ds > 0 && gen > 1 ? (gen - 1) / ds : 0.0);
+        print_stats(&r, stdout, np, gen, ps, ds);
+    }
     free(lg);
     free(prompt);
     tlm_kv_free(kv);

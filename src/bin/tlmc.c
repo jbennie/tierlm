@@ -44,6 +44,7 @@
  * Decisions go through tlm_decide (rules backend) with a JSONL audit log in
  * the work dir (research/04-decision-engine.md).
  */
+#include "tlm_bpe.h"
 #include "tlm_cfg.h"
 #include "tlm_decide.h"
 #include "tlm_io.h"
@@ -454,6 +455,25 @@ static void tokset_from_bytes(tokset *t, const uint8_t *b, size_t n, int V) {
     t->start[t->nseq] = t->n;
 }
 
+/* Real checkpoints: tokenise a UTF-8 corpus with the model's own BPE so the
+ * calibration heat reflects real tokens. SEQ_LEN chunking mirrors
+ * tokset_from_bytes. */
+static void tokset_from_bpe(tokset *t, const tlm_bpe *b, const uint8_t *bytes, size_t n) {
+    memset(t, 0, sizeof *t);
+    int cap = (int)n + 1;   /* BPE never emits more ids than input bytes */
+    t->tok = (int *)malloc(sizeof(int) * (size_t)cap);
+    t->start = (int *)malloc(sizeof(int) * ((size_t)cap / SEQ_LEN + 2));
+    if (!t->tok || !t->start) die("out of memory");
+    int m = tlm_bpe_encode(b, (const char *)bytes, n, 0, t->tok, cap);
+    if (m < 0) die("BPE corpus encode: output does not fit");
+    t->n = m;
+    for (int s = 0; s < t->n; s += SEQ_LEN) {
+        if (t->n - s < 2 && t->nseq > 0) break;   /* drop a 1-token tail */
+        t->start[t->nseq++] = s;
+    }
+    t->start[t->nseq] = t->n;
+}
+
 /* Pseudo-text so byte classes vary like real prompts (words, numbers,
  * punctuation, newlines). Different seeds never overlap in practice. */
 static uint8_t *synth_text(uint64_t seed, size_t n) {
@@ -761,6 +781,7 @@ typedef struct {
     evalcmp     prec_cmp;
     tokset      cal, ev;
     int         cal_synthetic, ev_synthetic;
+    int         cal_bpe;               /* corpus tokenised with the model's BPE (vs byte-level) */
     calib       C;
     evalres     R, A;            /* reference eval; accepted (pruned/demoted) eval */
     int         have_A;
@@ -1299,8 +1320,20 @@ static void load_tokens(cc *c) {
     if (c->eval_tokens > 0 && en > (size_t)c->eval_tokens) en = (size_t)c->eval_tokens;
     if (cn < 2 || en < 2) die("calibration and evaluation sets need at least 2 tokens each");
     sha_final(&s, c->corp_sha);
-    tokset_from_bytes(&c->cal, cb, cn, V);
-    tokset_from_bytes(&c->ev, eb, en, V);
+    /* Real checkpoints ship tokenizer.json: tokenise the corpus/eval with the
+     * model's own BPE so calibration heat reflects real tokens. Synthetic models
+     * (no tokenizer.json, or a vocab smaller than the model's) keep byte-level. */
+    char berr[256];
+    tlm_bpe *bpe = tlm_bpe_load(c->srcdir, berr, sizeof berr);
+    if (bpe && tlm_bpe_max_id(bpe) < V) {
+        c->cal_bpe = 1;
+        tokset_from_bpe(&c->cal, bpe, cb, cn);
+        tokset_from_bpe(&c->ev, bpe, eb, en);
+    } else {
+        tokset_from_bytes(&c->cal, cb, cn, V);
+        tokset_from_bytes(&c->ev, eb, en, V);
+    }
+    if (bpe) tlm_bpe_free(bpe);
     free(cb);
     free(eb);
 }
@@ -1915,6 +1948,7 @@ static char *build_report(cc *c, const tlm_manifest *m) {
     tlm_jw_int(&w, "tokens", (int64_t)c->C.ntok);
     tlm_jw_int(&w, "sequences", c->cal.nseq);
     tlm_jw_str(&w, "source", c->cal_synthetic ? "synthetic" : c->corpus_path);
+    tlm_jw_str(&w, "tokenizer", c->cal_bpe ? "bpe" : "byte");
     tlm_jw_bool(&w, "reused", c->reused_cal);
     tlm_jw_bool(&w, "below_200k_warning", c->C.ntok < MIN_CALIB_WARN);
     tlm_jw_begin_arr(&w, "class_prior");

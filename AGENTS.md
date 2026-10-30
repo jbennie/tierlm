@@ -55,6 +55,7 @@ make oracle MODEL=DIR MANIFEST=S.tlmm TOKENS=1,2,3   # P-121 oracle vs the HF re
 make -j asan                     # sanitizers
 scripts/demo-model.sh            # synthetic model in scratch/
 TIERLM_ETC=scratch/etc build/bin/tierlm run scratch/demo.tlmm --prompt Hi -n 32 --stats
+tools/m2_eval.sh STORE DRIVES OUT           # M2: cache sweep + I/O A/B -> summary.json, table.md
 ```
 
 ## Style

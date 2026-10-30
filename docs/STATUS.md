@@ -19,7 +19,7 @@ clean tree. The code is about 16k lines of C in `src/`, plus 6k lines of tests.
 | Worker pool: chunk claiming, deterministic split, L3-grouped pinning | done | `test_pool` |
 | safetensors reader (single and sharded) and writer (F32/F16/BF16/F8_E4M3 raw tensors); `tlm_st_read_fp8_block` decodes E4M3 weights with their `<name>_scale_inv` 128×128 F32 block-scale grid | done | `test_st` (writer round-trips, block-scale decode incl. partial blocks; refused: missing/non-F32/misshaped scales, 1-D FP8, E4M3 NaN codes) |
 | MoE decoder: RMSNorm, GQA with qk-norm, RoPE (NeoX + YaRN), softmax and sigmoid+bias routers, SwiGLU experts + shared expert, dense-FFN layers (`first_k_dense_replace`/`mlp_only_layers`, resident SwiGLU, no router), fixed combine order, KV cache, sampler, router-lookahead prefetch, expert mask | done | `test_model` (invariance across threads, cache sizes, kernels; dense prefix vs naive reference) |
-| BPE tokenizer: Qwen3 byte-level BPE (`tlm_bpe` encode/decode), NFC + Unicode tables, Qwen3 chat template, `--tokenizer` run wiring | done | `test_bpe` (round-trip + HF parity on a mixed corpus) |
+| BPE tokenizer: Qwen3 byte-level BPE (`tlm_bpe` encode/decode), NFC + Unicode tables, Qwen3 chat template, `--tokenizer` run wiring, and `tlmc compile --corpus` tokenisation (BPE when the source ships a `tokenizer.json`, else byte-level) | done | `test_bpe` (round-trip + HF parity on a mixed corpus); e2e (BPE vs byte corpus) |
 | Decision engine: Choice / Score / Noul questions, rules backend, SELF callback, confidence policy, JSONL audit log | done (rules) | `test_decide` |
 | `tlmc`: synth (incl. `--fp8` block-scale and `--dense-layers` checkpoints), compile passes 1–9 (exact / balanced / aggressive) over BF16/F16/F32 and FP8 E4M3 + 128×128 block-scale checkpoints, resume, REAP pruning with an eval gate, Q5_K demotion, heat-balanced placement with pins and replicas, report, atlas | done for Qwen3-MoE-like checkpoints (mixed dense + routed) | `tests/e2e.sh` (incl. the `synth --fp8` compile + run step; dense-prefix synth/compile/run) |
 | `tierlm`: run, bench, config show/check, missing-drive fallback to replicas | done | `tests/e2e.sh` |
@@ -31,15 +31,9 @@ Q6_K, 17.2 GB/s for Q8_0 and 15.0 GB/s for Q4_K, counted as weight bytes per sec
 ## Known gaps
 
 The core real-model path (M1) is done. The gaps below are the remaining edges: other model
-families (MLA, native MXFP4), calibration on real tokens, and the not-yet-built features (MTP,
-GPU KV, batching, cluster).
+families (MLA, native MXFP4), and the not-yet-built features (MTP, GPU KV, batching, cluster).
 
-1. **Calibration corpus still uses byte-level tokens.** The *runtime* tokenizer is now real Qwen3
-   BPE with the chat template (P-127, `test_bpe` parity gates pass), so `tierlm run --prompt`
-   tokenises like HF. But `tlmc compile --corpus` still maps bytes to tokens
-   (`tokset_from_bytes`, `byte % vocab`), so routing-heat and expert-saliency calibration
-   statistics are not yet based on real tokens.
-2. **Narrow ingest.** `tlmc compile` takes BF16/F16/F32 safetensors, and FP8 E4M3 safetensors with
+1. **Narrow ingest.** `tlmc compile` takes BF16/F16/F32 safetensors, and FP8 E4M3 safetensors with
    f32 128×128 block scales, for Qwen3-MoE / Qwen2-MoE style decoders: no attention biases. RoPE
    is plain NeoX or YaRN (`rope_scaling` type `yarn` is ingested and applied; other scaling types
    are refused). Dense-FFN prefix layers (`first_k_dense_replace`, `mlp_only_layers`) are
@@ -47,15 +41,15 @@ GPU KV, batching, cluster).
    with routed MoE layers. It refuses the following:
    - FP8 checkpoints with single-byte UE8M0 block scales (DeepSeek-V4 class)
    - MLA attention (DeepSeek V3/V4), GGUF input, and native MXFP4 experts
-3. **No MTP speculation.** `spec.mode = mtp` is accepted by the config schema, but the runtime warns
+2. **No MTP speculation.** `spec.mode = mtp` is accepted by the config schema, but the runtime warns
    and decodes without it. The packet type (`TLM_PKT_MTP`) and `geom.mtp_layers` exist.
-4. **No GPU KV.** `kv.device = hip:N` is accepted, and the runtime warns that the KV stays in RAM.
+3. **No GPU KV.** `kv.device = hip:N` is accepted, and the runtime warns that the KV stays in RAM.
    The KV cache is f32, sized for one sequence.
-5. **Single sequence.** There is no batching, no server and no prompt or prefix cache. Prefill runs
+4. **Single sequence.** There is no batching, no server and no prompt or prefix cache. Prefill runs
    token by token (`tlm_model_prefill` loops over `step`).
-6. **Decision engine: rules only.** The ENCODER backend (an embedded Laya / OpenJevX-class model)
+5. **Decision engine: rules only.** The ENCODER backend (an embedded Laya / OpenJevX-class model)
    is a stub that falls back to rules and records the fallback in the audit log.
-7. **Cluster and swarm are designs only** (`docs/design/cluster.md`, `docs/design/swarm.md`).
+6. **Cluster and swarm are designs only** (`docs/design/cluster.md`, `docs/design/swarm.md`).
    There is no `tlm_net` yet.
 
 ### Small API issues found by the builders
