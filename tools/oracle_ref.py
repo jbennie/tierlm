@@ -32,6 +32,8 @@ def main():
     ap.add_argument("model", help="HF model dir, e.g. ~/models/Qwen3-30B-A3B")
     ap.add_argument("--tokens", required=True, help="comma-separated teacher-forced ids")
     ap.add_argument("--topk", type=int, default=10)
+    ap.add_argument("--dtype", choices=["4bit", "bf16"], default="4bit",
+                    help="reference weights: 4bit (bnb, bring-up proxy) or bf16 (strict gate)")
     args = ap.parse_args()
 
     ids = parse_tokens(args.tokens)
@@ -40,21 +42,31 @@ def main():
 
     # Deferred: torch/transformers only exist in the oracle venv, not on a bare box.
     import torch
-    from transformers import AutoModelForCausalLM, BitsAndBytesConfig
+    from transformers import AutoModelForCausalLM
 
-    bnb = BitsAndBytesConfig(
-        load_in_4bit=True,
-        bnb_4bit_quant_type="nf4",
-        bnb_4bit_compute_dtype=torch.bfloat16,
-        bnb_4bit_use_double_quant=True,
-    )
-    model = AutoModelForCausalLM.from_pretrained(
-        args.model,
-        quantization_config=bnb,
-        torch_dtype=torch.bfloat16,
-        device_map="cpu",
-        low_cpu_mem_usage=True,
-    )
+    if args.dtype == "bf16":
+        # strict gate: full BF16 weights, no quantization
+        model = AutoModelForCausalLM.from_pretrained(
+            args.model,
+            torch_dtype=torch.bfloat16,
+            device_map="cpu",
+            low_cpu_mem_usage=True,
+        )
+    else:
+        from transformers import BitsAndBytesConfig
+        bnb = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_quant_type="nf4",
+            bnb_4bit_compute_dtype=torch.bfloat16,
+            bnb_4bit_use_double_quant=True,
+        )
+        model = AutoModelForCausalLM.from_pretrained(
+            args.model,
+            quantization_config=bnb,
+            torch_dtype=torch.bfloat16,
+            device_map="cpu",
+            low_cpu_mem_usage=True,
+        )
     model.eval()
 
     inp = torch.tensor([ids], dtype=torch.long)

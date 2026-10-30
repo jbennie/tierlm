@@ -13,8 +13,8 @@
 #
 # The reference is 4-bit on CPU (fits ~22GB). The metric is per-position
 # argmax + top-k id-set overlap, which is scale-invariant, so the 4-bit
-# reference is a valid proxy for bring-up; the strict BF16 gate runs later on
-# a GPU box (betty).
+# reference is a valid proxy for bring-up. The strict BF16 gate runs on the
+# same box: `oracle_ref.py ... --dtype bf16` (full BF16 forward, ~90 s).
 set -euo pipefail
 
 MODEL="${1:?usage: oracle.sh MODEL MANIFEST TOKENS [TOPK] [PY]}"

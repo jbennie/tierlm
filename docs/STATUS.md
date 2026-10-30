@@ -1,6 +1,6 @@
 # Status
 
-Last updated 2026-10-19. This page is the hand-over point: read it before picking up work.
+Last updated 2026-10-30. This page is the hand-over point: read it before picking up work.
 
 ## What exists and is tested
 
@@ -85,10 +85,21 @@ These are the gaps that stop tierlm from running a real model today.
 The order follows `research/01-review-and-plan.md` as amended by `research/03-two-stage-design.md`.
 Each milestone ends on a gate.
 
-**M1 progress (2026-10-19):** BPE tokenizer + chat template (P-127), YaRN RoPE and the
-teacher-forced oracle (P-121) are done in sibling slices (`tierlm-tok`, `tierlm-yarn`,
-`tierlm-oracle`) awaiting integration; this slice adds FP8 block-scale ingest. Not started:
-dense-prefix layers. The gate run on Qwen3-30B-A3B needs a GPU/HF box.
+**M1 progress (2026-10-30):** BPE tokenizer + chat template (P-127, `test_bpe` parity gates pass), YaRN RoPE,
+dense-prefix layers (`first_k_dense_replace`/`mlp_only_layers`) and FP8 E4M3 block-scale ingest
+are integrated. The teacher-forced oracle (P-121) now runs a real model: Qwen3-30B-A3B compiled
+with `tlmc` to `~/tierlm-m1/q30b.tlmm` (48 layers, 128 experts top-8, Q8_0 experts + dense),
+and the strict gate compares tierlm's per-position argmax against a full BF16 HF forward on this
+box (`tools/oracle_ref.py --dtype bf16`, ~90 s; the old "GPU box betty" note is obsolete).
+
+**Oracle-gate result (152-token prompt, BF16 reference):** 142/152 positions match. The 10
+mismatches are all exact or BF16-precision near-ties in the reference (margin 0.0 or 0.125, the
+smallest resolvable BF16 logit gap) — quantization noise, not a bug. The initial pos0 (1-token
+context) mismatch was root-caused to the Q6_K expert precision: SiLU multiplies a large gate
+(~47) by a small up (~0), amplifying the 1.76 % Q6_K weight error to a 12.5 % MoE-delta error,
+which the next attention layer magnifies into a routing inversion. Recompiling the experts at
+Q8_0 (the highest supported expert tier; Q8_K/FP8 are rejected for experts) closed pos0 and two
+more positions, leaving only tie noise.
 
 | # | Milestone | Main work | Gate |
 | --- | --- | --- | --- |
