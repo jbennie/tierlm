@@ -51,6 +51,7 @@ Read `docs/STATUS.md` first: it lists what works, the known gaps and the next mi
 
 ```sh
 make -j && make -j test          # build + full suite (~40 s)
+make oracle MODEL=DIR MANIFEST=S.tlmm TOKENS=1,2,3   # P-121 oracle vs the HF reference (the M1 gate)
 make -j asan                     # sanitizers
 scripts/demo-model.sh            # synthetic model in scratch/
 TIERLM_ETC=scratch/etc build/bin/tierlm run scratch/demo.tlmm --prompt Hi -n 32 --stats

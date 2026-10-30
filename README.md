@@ -24,10 +24,11 @@ down as pseudocode fragments with their origin tagged, scored which patterns sev
 converge on, and built only from those. No reference code is copied (see `NOTICE` and
 `fragments/`).
 
-> Status: early. The full pipeline works end to end on synthetic Qwen3-MoE-like models and is
-> covered by unit, end-to-end and sanitizer tests. It does not yet run a real model: there is no
-> real tokenizer, and MTP speculation, GPU KV and the cluster mode are not built yet. See
-> [`docs/STATUS.md`](docs/STATUS.md).
+> Status: M1 (real-model bring-up) is done. tierlm now runs a real model end to end — Qwen3-30B-A3B
+> compiled by `tlmc` and run on CPU — with a real BPE tokenizer + chat template. The output is
+> teacher-forced-verified against a full HF forward (142/152 per-position argmax; the misses are
+> reference ties). MTP speculation, GPU KV and the cluster mode are not built yet. See
+> [`docs/STATUS.md`](docs/STATUS.md) and [`docs/DEPLOY.md`](docs/DEPLOY.md).
 
 ## Build
 

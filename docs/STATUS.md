@@ -18,7 +18,8 @@ clean tree. The code is about 16k lines of C in `src/`, plus 6k lines of tests.
 | Expert store: fixed slot arena, reserve → loading → ready → released, global LFU with decay, pins, warm sidecar, prefetch that never displaces demand | done | `test_store`, the e2e tiny-vs-large cache check |
 | Worker pool: chunk claiming, deterministic split, L3-grouped pinning | done | `test_pool` |
 | safetensors reader (single and sharded) and writer (F32/F16/BF16/F8_E4M3 raw tensors); `tlm_st_read_fp8_block` decodes E4M3 weights with their `<name>_scale_inv` 128×128 F32 block-scale grid | done | `test_st` (writer round-trips, block-scale decode incl. partial blocks; refused: missing/non-F32/misshaped scales, 1-D FP8, E4M3 NaN codes) |
-| MoE decoder: RMSNorm, GQA with qk-norm, RoPE (NeoX), softmax and sigmoid+bias routers, SwiGLU experts + shared expert, dense-FFN layers (`first_k_dense_replace`/`mlp_only_layers`, resident SwiGLU, no router), fixed combine order, KV cache, sampler, router-lookahead prefetch, expert mask | done | `test_model` (invariance across threads, cache sizes, kernels; dense prefix vs naive reference) |
+| MoE decoder: RMSNorm, GQA with qk-norm, RoPE (NeoX + YaRN), softmax and sigmoid+bias routers, SwiGLU experts + shared expert, dense-FFN layers (`first_k_dense_replace`/`mlp_only_layers`, resident SwiGLU, no router), fixed combine order, KV cache, sampler, router-lookahead prefetch, expert mask | done | `test_model` (invariance across threads, cache sizes, kernels; dense prefix vs naive reference) |
+| BPE tokenizer: Qwen3 byte-level BPE (`tlm_bpe` encode/decode), NFC + Unicode tables, Qwen3 chat template, `--tokenizer` run wiring | done | `test_bpe` (round-trip + HF parity on a mixed corpus) |
 | Decision engine: Choice / Score / Noul questions, rules backend, SELF callback, confidence policy, JSONL audit log | done (rules) | `test_decide` |
 | `tlmc`: synth (incl. `--fp8` block-scale and `--dense-layers` checkpoints), compile passes 1–9 (exact / balanced / aggressive) over BF16/F16/F32 and FP8 E4M3 + 128×128 block-scale checkpoints, resume, REAP pruning with an eval gate, Q5_K demotion, heat-balanced placement with pins and replicas, report, atlas | done for Qwen3-MoE-like checkpoints (mixed dense + routed) | `tests/e2e.sh` (incl. the `synth --fp8` compile + run step; dense-prefix synth/compile/run) |
 | `tierlm`: run, bench, config show/check, missing-drive fallback to replicas | done | `tests/e2e.sh` |
@@ -29,18 +30,21 @@ Q6_K, 17.2 GB/s for Q8_0 and 15.0 GB/s for Q4_K, counted as weight bytes per sec
 
 ## Known gaps
 
-These are the gaps that stop tierlm from running a real model today.
+The core real-model path (M1) is done. The gaps below are the remaining edges: other model
+families (MLA, native MXFP4), calibration on real tokens, and the not-yet-built features (MTP,
+GPU KV, batching, cluster).
 
-1. **No real tokenizer.** Prompts are byte-level (`token = byte mod vocab`), which only means
-   something for synthetic models. Calibration corpora go through the same byte mapping. You can
-   use `tierlm run --tokens 1,2,3` with ids from an external tokenizer, but `tlmc --corpus` needs
-   the real tokenizer before its calibration statistics mean anything. This needs BPE plus the
-   chat template, with the parity gates of P-127.
+1. **Calibration corpus still uses byte-level tokens.** The *runtime* tokenizer is now real Qwen3
+   BPE with the chat template (P-127, `test_bpe` parity gates pass), so `tierlm run --prompt`
+   tokenises like HF. But `tlmc compile --corpus` still maps bytes to tokens
+   (`tokset_from_bytes`, `byte % vocab`), so routing-heat and expert-saliency calibration
+   statistics are not yet based on real tokens.
 2. **Narrow ingest.** `tlmc compile` takes BF16/F16/F32 safetensors, and FP8 E4M3 safetensors with
-   f32 128×128 block scales, for Qwen3-MoE / Qwen2-MoE style decoders: no attention biases, plain
-   RoPE (`rope_scaling` is ignored with a warning). Dense-FFN prefix layers
-   (`first_k_dense_replace`, `mlp_only_layers`) are supported: those layers become resident SwiGLU
-   DENSE packets (no router, no experts), mixed with routed MoE layers. It refuses the following:
+   f32 128×128 block scales, for Qwen3-MoE / Qwen2-MoE style decoders: no attention biases. RoPE
+   is plain NeoX or YaRN (`rope_scaling` type `yarn` is ingested and applied; other scaling types
+   are refused). Dense-FFN prefix layers (`first_k_dense_replace`, `mlp_only_layers`) are
+   supported: those layers become resident SwiGLU DENSE packets (no router, no experts), mixed
+   with routed MoE layers. It refuses the following:
    - FP8 checkpoints with single-byte UE8M0 block scales (DeepSeek-V4 class)
    - MLA attention (DeepSeek V3/V4), GGUF input, and native MXFP4 experts
 3. **No MTP speculation.** `spec.mode = mtp` is accepted by the config schema, but the runtime warns
@@ -80,12 +84,12 @@ These are the gaps that stop tierlm from running a real model today.
   manifest. Adding them to the manifest would remove these reads.
 - Not built: `tlmc replan`, `tierlm serve`, chat mode.
 
-## Next milestones
+## Milestones
 
 The order follows `research/01-review-and-plan.md` as amended by `research/03-two-stage-design.md`.
 Each milestone ends on a gate.
 
-**M1 progress (2026-10-30):** BPE tokenizer + chat template (P-127, `test_bpe` parity gates pass), YaRN RoPE,
+**M1 — complete (2026-10-30):** BPE tokenizer + chat template (P-127, `test_bpe` parity gates pass), YaRN RoPE,
 dense-prefix layers (`first_k_dense_replace`/`mlp_only_layers`) and FP8 E4M3 block-scale ingest
 are integrated. The teacher-forced oracle (P-121) now runs a real model: Qwen3-30B-A3B compiled
 with `tlmc` to `~/tierlm-m1/q30b.tlmm` (48 layers, 128 experts top-8, Q8_0 experts + dense),
@@ -101,9 +105,14 @@ which the next attention layer magnifies into a routing inversion. Recompiling t
 Q8_0 (the highest supported expert tier; Q8_K/FP8 are rejected for experts) closed pos0 and two
 more positions, leaving only tie noise.
 
+All five M1 deliverables are delivered and verified: `make test` (unit + e2e, including the BPE
+parity, FP8, dense-prefix, YaRN and oracle steps) and `make asan` pass from a clean tree, and the
+strict oracle gate (per-position argmax vs a full BF16 HF forward) holds at 142/152 with only
+tie-noise misses.
+
 | # | Milestone | Main work | Gate |
 | --- | --- | --- | --- |
-| M1 | Real model bring-up | BPE tokenizer + chat template (P-127); FP8 block-scale ingest; dense-prefix layers; YaRN RoPE; teacher-forced oracle against HF transformers (P-121) on Qwen3-30B-A3B | per-position argmax matches the reference; tokenizer parity on a mixed corpus |
+| **M1** ✅ | Real model bring-up | BPE tokenizer + chat template (P-127); FP8 block-scale ingest; dense-prefix layers; YaRN RoPE; teacher-forced oracle against HF transformers (P-121) on Qwen3-30B-A3B | per-position argmax matches the reference; tokenizer parity on a mixed corpus |
 | M2 | Measure on the WRX90 | `make PROFILE=wrx90`; `tierlm-setup --drive` on all four NVMe; `fio` baseline; `tierlm bench` on Qwen3-235B-A22B at Q6_K with cache sweeps; io_uring vs pread and O_DIRECT A/B (C-02, C-03) | ≥ 85% of `fio` bandwidth on misses; decode tok/s recorded with hit rate |
 | M3 | MTP speculation | MTP head packets (Q8_0, P-84); chain drafting with adaptive depth 0–4; batched verify; pause below 70% acceptance (P-85); expert-budget-aware draft length | output identical to non-speculative greedy; speed-up measured |
 | M4 | GPU KV on the R9700s | optional `dlopen` ROCm backend: Q/K/V shipped per layer, paged KV in ≤ 10% VRAM, CPU fallback | bit-for-bit vs the CPU KV at f32; context length vs `kv.vram_frac` |
