@@ -205,19 +205,31 @@ All keys are documented in `etc/tierlm.conf.example`.
 ## 6. M2 measurement plan
 
 The **M2 gate is ≥ 85% of `fio` sequential-read bandwidth on expert misses**, with decode tok/s
-recorded at the hit rate. The steps:
+recorded at the hit rate. The whole sweep is one command — the harness runs the probe, the
+per-drive `fio` baseline, the cache-size sweep, and both A/B tests, then writes the gate:
 
-1. **Baseline the drives with `fio`** at the expert-read size (4–8 MB, deep queue):
-   ```sh
-   fio --name=read --rw=read --bs=4m --direct=1 --iodepth=32 --numjobs=1 \
-       --filename=/mnt/nvme0/fiofile --size=4G --runtime=60
-   ```
-   Record per-drive and aggregate sequential-read bandwidth.
-2. **Sweep the expert cache** with `tierlm bench --cache 1G`, `4G`, `8G`, … and record tok/s +
-   hit rate at each point. This is the cache-size curve.
-3. **A/B the I/O backend:** `--io pread` vs `--io io_uring`.
-4. **A/B O_DIRECT:** `--direct yes` vs `--direct no`.
-5. **Compare** the miss bandwidth from `--stats` against the `fio` baseline. The gate is ≥ 85%.
+```sh
+tools/m2_eval.sh ~/stores/qwen3-235b.tlmm /mnt/nvme0,/mnt/nvme1,/mnt/nvme2,/mnt/nvme3 m2out
+```
+
+The drive list must be in the store's manifest order (the gate indexes the fio baseline to the
+bench's drive index). Outputs land in the third argument:
+
+- `summary.json` — one object per run: raw counters, per-drive expert-read GiB/s, the fio
+  baseline, and `gate` = the minimum over drives of (expert-read / fio). **`gate >= 0.85` passes.**
+- `table.md` — the cache sweep as a markdown table (tok/s, hit rate, per-drive bandwidth).
+- `fio.txt`, `probe.txt`, `report.txt`, `bench/*.json` — the raw inputs, for re-deriving anything.
+
+Environment knobs (all optional): `CACHE_LIST` (default `1G 4G 8G 16G 32G 64G`), `AB_CACHE`
+(default `16G`), `PLEN`/`GEN` (512/128), `FIO_RUNTIME` (seconds per drive, default 30; `0`
+skips fio and leaves `gate` null), `NO_PROBE=1`. The harness needs `jq`; `fio` is optional but
+required for the gate. If io_uring is not available in the build, the A/B run records the
+backend it actually used, so a pread fallback is visible in the JSON.
+
+To do it by hand instead, the steps are: baseline each drive with `fio` at the expert-read size
+(4–8 MB, deep queue); sweep `tierlm bench --cache 1G`, `4G`, `8G`, … and record tok/s + hit rate;
+A/B `--io pread` vs `--io io_uring`; A/B `--direct yes` vs `--direct no`; compare the miss
+bandwidth from `--stats-json` against the fio baseline.
 
 Write the measured numbers back into `research/02-wrx90-build-profile.md` — it currently holds
 engineering estimates that M2 replaces with real measurements.
