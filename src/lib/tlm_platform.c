@@ -9,6 +9,7 @@
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <sys/utsname.h>
 #include <time.h>
 #include <unistd.h>
 #if defined(__x86_64__) || defined(__i386__)
@@ -395,6 +396,34 @@ int tlm_mem_snapshot(tlm_mem_info *out) {
         out->cgroup_limit = lim;
         uint64_t avail = ok2 && use < lim ? lim - use : 0;
         if (avail < out->available_bytes) out->available_bytes = avail;
+    }
+    return TLM_OK;
+}
+
+/* ---- OS -------------------------------------------------------------- */
+int tlm_os_snapshot(tlm_os_info *out) {
+    memset(out, 0, sizeof *out);
+    snprintf(out->pretty, sizeof out->pretty, "unknown");
+    snprintf(out->release, sizeof out->release, "unknown");
+    struct utsname u;
+    if (uname(&u) == 0) snprintf(out->release, sizeof out->release, "%.63s", u.release);
+    char *data = NULL;
+    if (tlm_read_file("/etc/os-release", &data, NULL) == TLM_OK) {
+        static const char key[] = "PRETTY_NAME=";
+        char *next = NULL;
+        for (char *line = strtok_r(data, "\n", &next); line; line = strtok_r(NULL, "\n", &next)) {
+            if (strncmp(line, key, sizeof key - 1) != 0) continue;
+            char *v = line + (sizeof key - 1);
+            size_t n = strlen(v);
+            if (n >= 2 && v[0] == '"' && v[n - 1] == '"') {
+                v++;
+                n -= 2;
+            }
+            if (n > sizeof out->pretty - 1) n = sizeof out->pretty - 1;
+            snprintf(out->pretty, sizeof out->pretty, "%.*s", (int)n, v);
+            break;
+        }
+        free(data);
     }
     return TLM_OK;
 }

@@ -41,6 +41,11 @@
 
 #define TIERLM_VERSION "0.1"
 
+/* Short git revision the binary was built from (Makefile -DTLM_GIT_SHA). */
+#ifndef TLM_GIT_SHA
+#define TLM_GIT_SHA "unknown"
+#endif
+
 static void die(const char *fmt, ...) __attribute__((format(printf, 1, 2), noreturn));
 static void die(const char *fmt, ...) {
     va_list ap;
@@ -304,6 +309,99 @@ static void rt_close(runtime *r, const opts *o) {
     memset(r, 0, sizeof *r);
 }
 
+/* ---- run stamp: host/hardware/software/model identity for the stats ----
+ * Every --stats / --stats-json block is prefixed with it so a metric file is
+ * self-describing: which host, with what hardware and which build, ran which
+ * store. tools/m2_eval.sh carries meta: into summary.json. */
+typedef struct {
+    char     host[128];
+    char     cpu[96];
+    int      cores, cpus;
+    uint64_t ram_gib;
+    char     os[128];
+    char     kernel[64];
+    char     store[64];
+    char     profile[16];
+    char     sha[65];
+    uint32_t layers, experts, top_k;
+} run_stamp;
+
+static void hex64(const uint8_t *d, char *out) {
+    static const char hx[] = "0123456789abcdef";
+    for (int i = 0; i < 32; i++) {
+        out[2 * i] = hx[d[i] >> 4];
+        out[2 * i + 1] = hx[d[i] & 0xF];
+    }
+    out[64] = 0;
+}
+
+static void get_run_stamp(runtime *r, run_stamp *s) {
+    const tlm_cpu_info *ci = tlm_cpu();
+    tlm_mem_info mi;
+    tlm_os_info oi;
+    if (gethostname(s->host, sizeof s->host) != 0) s->host[0] = 0;
+    s->host[sizeof s->host - 1] = 0;
+    if (!s->host[0]) snprintf(s->host, sizeof s->host, "unknown");
+    snprintf(s->cpu, sizeof s->cpu, "%s", ci->model_name[0] ? ci->model_name : "unknown");
+    s->cores = ci->physical_cores;
+    s->cpus = ci->logical_cpus;
+    s->ram_gib = tlm_mem_snapshot(&mi) == 0 ? mi.total_bytes >> 30 : 0;
+    tlm_os_snapshot(&oi);
+    snprintf(s->os, sizeof s->os, "%s", oi.pretty);
+    snprintf(s->kernel, sizeof s->kernel, "%s", oi.release);
+    snprintf(s->store, sizeof s->store, "%s", r->m.name);
+    snprintf(s->profile, sizeof s->profile, "%s", r->m.profile);
+    hex64(r->m.source_sha256, s->sha);
+    s->layers = r->m.geom.n_layers;
+    s->experts = r->m.geom.n_experts;
+    s->top_k = r->m.geom.top_k;
+}
+
+static void print_run_stamp(const run_stamp *s, FILE *f) {
+    fprintf(f, "run         host %s, cpu %s (%d cores / %d cpus), ram %llu GiB, os %s %s, "
+               "build %s %s, store %s (%s, %u layers, %u experts top-%u, sha %s)\n",
+            s->host, s->cpu, s->cores, s->cpus, (unsigned long long)s->ram_gib,
+            s->os, s->kernel, TIERLM_VERSION, TLM_GIT_SHA,
+            s->store, s->profile, s->layers, s->experts, s->top_k, s->sha);
+}
+
+static void json_str(FILE *f, const char *s) {
+    fputc('"', f);
+    for (const unsigned char *p = (const unsigned char *)s; *p; p++) {
+        switch (*p) {
+        case '"': fputs("\\\"", f); break;
+        case '\\': fputs("\\\\", f); break;
+        case '\n': fputs("\\n", f); break;
+        case '\t': fputs("\\t", f); break;
+        case '\r': fputs("\\r", f); break;
+        default:
+            if (*p < 0x20) fprintf(f, "\\u%04x", *p);
+            else fputc(*p, f);
+        }
+    }
+    fputc('"', f);
+}
+
+static void print_run_stamp_json(const run_stamp *s, FILE *f) {
+    fprintf(f, "\"meta\":{\"host\":");
+    json_str(f, s->host);
+    fprintf(f, ",\"cpu\":");
+    json_str(f, s->cpu);
+    fprintf(f, ",\"cores\":%d,\"cpus\":%d,\"ram_gib\":%llu,", s->cores, s->cpus,
+            (unsigned long long)s->ram_gib);
+    fprintf(f, "\"os\":");
+    json_str(f, s->os);
+    fprintf(f, ",\"kernel\":");
+    json_str(f, s->kernel);
+    fprintf(f, ",\"version\":\"%s\",\"build\":\"%s\",", TIERLM_VERSION, TLM_GIT_SHA);
+    fprintf(f, "\"store\":{\"name\":");
+    json_str(f, s->store);
+    fprintf(f, ",\"profile\":");
+    json_str(f, s->profile);
+    fprintf(f, ",\"source_sha256\":\"%s\",\"layers\":%u,\"experts\":%u,\"top_k\":%u}},",
+            s->sha, s->layers, s->experts, s->top_k);
+}
+
 static void print_stats(runtime *r, FILE *f, int n_prompt, int n_gen, double prefill_s, double decode_s) {
     tlm_model_stats ms;
     tlm_model_get_stats(r->mdl, &ms);
@@ -311,6 +409,11 @@ static void print_stats(runtime *r, FILE *f, int n_prompt, int n_gen, double pre
     tlm_store_get_stats(r->st, &ss);
     char b1[32], b2[32], b3[32];
     fprintf(f, "-- stats --\n");
+    {
+        run_stamp stamp;
+        get_run_stamp(r, &stamp);
+        print_run_stamp(&stamp, f);
+    }
     fprintf(f, "load        %.3f s (manifest, resident packets, pins); kernel %s, %d thread%s\n", r->load_s,
             tlm_quant_tier(), r->threads, r->threads == 1 ? "" : "s");
     fprintf(f, "tokens      prompt %d, generated %d; prefill %.1f tok/s, decode %.1f tok/s\n", n_prompt, n_gen,
@@ -351,7 +454,13 @@ static void print_stats_json(runtime *r, FILE *f, int n_prompt, int n_gen, doubl
     tlm_store_get_stats(r->st, &ss);
     uint64_t acc = ss.hits + ss.misses;
     double per = ms.tokens ? 1e-6 / (double)ms.tokens : 0;
-    fprintf(f, "{\"prompt\":%d,\"generated\":%d,\"prefill_tok_s\":%.3f,\"decode_tok_s\":%.3f,",
+    {
+        run_stamp stamp;
+        get_run_stamp(r, &stamp);
+        fprintf(f, "{");
+        print_run_stamp_json(&stamp, f);
+    }
+    fprintf(f, "\"prompt\":%d,\"generated\":%d,\"prefill_tok_s\":%.3f,\"decode_tok_s\":%.3f,",
             n_prompt, n_gen, prefill_s > 0 ? (double)n_prompt / prefill_s : 0.0,
             decode_s > 0 && n_gen > 1 ? (double)(n_gen - 1) / decode_s : 0.0);
     fprintf(f, "\"per_token_ms\":{\"attention\":%.3f,\"moe\":%.3f,\"expert_wait\":%.3f,\"other\":%.3f},",

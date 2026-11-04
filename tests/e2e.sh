@@ -59,6 +59,11 @@ run_logged "$T/tok.out" "$B/tierlm" run "$T/models/exact.tlmm" --tokens 72,101,1
 [ "$(wc -w < "$T/tok.out")" -eq 4 ] || fail "--tokens run"
 run_logged "$T/bench.out" "$B/tierlm" bench "$T/models/exact.tlmm" --prompt-len 16 -n 16
 grep -q "tok/s" "$T/bench.out" || fail "bench"
+grep -Eq '^run +host .*, cpu .*, ram [0-9]+ GiB, os .*, build [^,]+, store .*, sha [0-9a-f]{64}\)$' "$T/bench.out" \
+    || fail "bench run stamp (host/cpu/ram/os/build/store) missing"
+run_logged "$T/bench.json" "$B/tierlm" bench "$T/models/exact.tlmm" --prompt-len 16 -n 16 --stats-json
+grep -Eq '"meta":\{"host":"[^"]*"' "$T/bench.json" || fail "bench --stats-json meta stamp missing"
+grep -Eq '"source_sha256":"[0-9a-f]{64}"' "$T/bench.json" || fail "bench --stats-json store sha missing"
 step "oracle: per-position teacher-forced top-k dump (P-121)"
 run_logged "$T/oracle.out" "$B/tierlm" oracle "$T/models/exact.tlmm" --tokens 1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16
 [ "$(grep -c '^{"pos"' "$T/oracle.out")" -eq 16 ] || fail "oracle emitted $(grep -c '^{"pos"' "$T/oracle.out") positions, want 16"

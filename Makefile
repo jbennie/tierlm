@@ -21,6 +21,14 @@ OPTFLAGS  ?= -O2
 CSTD       = -std=c11
 WARN       = -Wall -Wextra -Wno-unused-parameter -Wshadow -Wpointer-arith
 CPPFLAGS  += -D_GNU_SOURCE -Isrc/lib
+
+# Stamp the binaries with the git revision they were built from (run stamp in
+# the stats output). Empty outside a git checkout; the code falls back to
+# "unknown".
+GITSHA    := $(shell git rev-parse --short HEAD 2>/dev/null)
+ifneq ($(GITSHA),)
+CPPFLAGS  += -DTLM_GIT_SHA='"$(GITSHA)"'
+endif
 CFLAGS    += $(CSTD) $(WARN) $(OPTFLAGS) -g -pthread -fno-math-errno -ffp-contract=off
 LDLIBS    += -lm -pthread
 

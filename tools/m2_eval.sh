@@ -137,6 +137,7 @@ say "writing summary.json"
                | if length > 0 then min else null end) as $gate
             | {
                 name: $name,
+                meta: $s.meta,
                 decode_tok_s: $s.decode_tok_s,
                 hit_rate: $s.store.hit_rate,
                 hits: $s.store.hits,
@@ -161,8 +162,11 @@ say "writing table.md"
 
 {
     printf '# M2 summary\n\n'
-    printf 'store: `%s`\n\ndecode tok/s and hit rate across the expert-cache sweep,\n' "$STORE"
-    printf 'with the per-drive expert-read bandwidth (busy GiB/s) and the gate\n'
+    printf 'store: `%s`\n' "$STORE"
+    jq -r '.[0].meta // empty
+        | "host: \(.host) — \(.cpu), \(.cores) cores / \(.cpus) cpus, \(.ram_gib) GiB RAM, \(.os) \(.kernel), build \(.version) \(.build), store \(.store.name) (\(.store.profile), sha \(.store.source_sha256[0:12]))"' \
+        "$OUT/summary.json"
+    printf '\ndecode tok/s and hit rate across the expert-cache sweep, with the per-drive expert-read bandwidth and the gate\n'
     printf '(busy GiB/s / fio GiB/s; needs to be >= 0.85). GiB = 2^30 bytes.\n\n'
     printf '| run | decode tok/s | hit %% | misses | read GiB | busy GiB/s | eff GiB/s | backend | gate |\n'
     printf '|---|---|---|---|---|---|---|---|---|\n'

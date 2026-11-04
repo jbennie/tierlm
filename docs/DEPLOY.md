@@ -221,7 +221,10 @@ diff /tmp/a /tmp/b        # empty = identical output
 ```
 
 This is the M2 measurement driver. It runs a fixed prompt length and a fixed number of decode
-tokens, and `--stats` gives the hit rate and per-drive bandwidth.
+tokens, and `--stats` gives the hit rate and per-drive bandwidth. Every stats block (text and
+`--stats-json`) starts with a **run stamp** — `host, cpu, cores, RAM, OS, kernel, build (git
+revision), store name/profile/geometry/source-sha` — so each metric file is self-describing:
+you can always tell which box, with what hardware and which build, ran which store.
 
 ### Config: `tierlm config`
 
@@ -252,9 +255,11 @@ CACHE_LIST="1G 4G 8G 16G 32G" AB_CACHE=16G \
 The drive list must be in the store's manifest order (the gate indexes the fio baseline to the
 bench's drive index). Outputs land in the third argument:
 
-- `summary.json` — one object per run: raw counters, per-drive expert-read GiB/s, the fio
-  baseline, and `gate` = the minimum over drives of (expert-read / fio). **`gate >= 0.85` passes.**
-- `table.md` — the cache sweep as a markdown table (tok/s, hit rate, per-drive bandwidth).
+- `summary.json` — one object per run: the run-stamp `meta` (host, CPU, RAM, OS, build, store
+  identity), raw counters, per-drive expert-read GiB/s, the fio baseline, and `gate` = the
+  minimum over drives of (expert-read / fio). **`gate >= 0.85` passes.**
+- `table.md` — the sweep as a markdown table (tok/s, hit rate, per-drive bandwidth), headed by
+  the host/CPU/build line so the file says where it came from.
 - `fio.txt`, `probe.txt`, `report.txt`, `bench/*.json` — the raw inputs, for re-deriving anything.
 
 Environment knobs (all optional): `CACHE_LIST` (default `1G 4G 8G 16G 32G 64G`), `AB_CACHE`

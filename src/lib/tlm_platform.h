@@ -124,6 +124,13 @@ typedef struct {
 } tlm_mem_info;
 int tlm_mem_snapshot(tlm_mem_info *out);
 
+/* ---- OS ---------------------------------------------------------- */
+typedef struct {
+    char pretty[128];    /* PRETTY_NAME from /etc/os-release; "unknown" if absent */
+    char release[64];    /* uname -r; "unknown" on failure */
+} tlm_os_info;
+int tlm_os_snapshot(tlm_os_info *out);
+
 /* ---- misc ------------------------------------------------------------ */
 uint32_t tlm_crc32c(uint32_t crc, const void *buf, size_t len);  /* Castagnoli, init 0 */
 /* Parse "12G", "512M", "4096", "0.5" (fraction returned via *frac when it has a '.') */
