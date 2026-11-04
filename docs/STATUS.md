@@ -108,7 +108,7 @@ tie-noise misses.
 | # | Milestone | Main work | Gate |
 | --- | --- | --- | --- |
 | **M1** ✅ | Real model bring-up | BPE tokenizer + chat template (P-127); FP8 block-scale ingest; dense-prefix layers; YaRN RoPE; teacher-forced oracle against HF transformers (P-121) on Qwen3-30B-A3B | per-position argmax matches the reference; tokenizer parity on a mixed corpus |
-| M2 | Measure on the WRX90 | `make PROFILE=wrx90`; `tierlm-setup --drive` on all four NVMe; `fio` baseline; `tierlm bench` on Qwen3-235B-A22B at Q6_K with cache sweeps; io_uring vs pread and O_DIRECT A/B (C-02, C-03) | ≥ 85% of `fio` bandwidth on misses; decode tok/s recorded with hit rate |
+| M2 | Measure on the M2 hosts — **drogo** (Ryzen 5 4500G 6C/12T Zen 2, 32 GB, 4× 1 TB NVMe on a 4-way PCIe 3.0 adapter, the multi-drive host) and **doris** (E5-2630 v3 8C/16T Haswell, 64 GB, 1× 256 GB NVMe); both AVX2, RHEL 10.3 | portable `make URING=1` (identical build on both); `tlmc compile` Qwen3-30B-A3B (Q6_K experts + Q8_0 dense, ~28 GB); `tools/m2_eval.sh` per host: drogo sweep 1–16 G over 4 drives, doris sweep 1–32 G over 1 drive; io_uring vs pread and O_DIRECT A/B (C-02, C-03) | ≥ 85% of `fio` bandwidth on misses (per drive); decode tok/s recorded with hit rate; sharding/parallel-read/replica behaviour demonstrated on drogo |
 | M3 | MTP speculation | MTP head packets (Q8_0, P-84); chain drafting with adaptive depth 0–4; batched verify; pause below 70% acceptance (P-85); expert-budget-aware draft length | output identical to non-speculative greedy; speed-up measured |
 | M4 | GPU KV on the R9700s | optional `dlopen` ROCm backend: Q/K/V shipped per layer, paged KV in ≤ 10% VRAM, CPU fallback | bit-for-bit vs the CPU KV at f32; context length vs `kv.vram_frac` |
 | M5 | Flagship family | MLA + compressed KV, native MXFP4 experts, DSA indexer (DeepSeek V4 Flash class) | teacher-forced match; ≥ 1 tok/s warm decode |
@@ -121,3 +121,9 @@ tie-noise misses.
 - **Default compile profile:** `exact` (no pruning). `balanced` and `aggressive` are opt-in and
   gated.
 - **Default I/O backend:** the pread pool. Change it to io_uring only after M2 measures a gain.
+- **M2 hosts (2026-11-04, user-confirmed):** the WRX90 plan (24 Zen 5 cores, 128 GB DDR5, 4 NVMe,
+  Qwen3-235B-A22B) is shelved — the machine is not available. M2 runs on drogo + doris (both AVX2,
+  single- or 4-drive, consumer-class PCIe 3.0 NVMe) with Qwen3-30B-A3B. Reason for the model swap:
+  the 235B's ~470 GB BF16 source does not fit the original 254/256 GB drives; it stays possible on
+  drogo's 4× 1 TB later. Multi-drive experiments run on drogo (4-way adapter, 2080 Ti removed);
+  doris is the single-drive comparison.
