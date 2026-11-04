@@ -1,6 +1,6 @@
 # Status
 
-Last updated 2026-10-30. This page is the hand-over point: read it before picking up work.
+Last updated 2026-11-04. This page is the hand-over point: read it before picking up work.
 
 ## What exists and is tested
 
@@ -23,6 +23,7 @@ clean tree. The code is about 16k lines of C in `src/`, plus 6k lines of tests.
 | Decision engine: Choice / Score / Noul questions, rules backend, SELF callback, confidence policy, JSONL audit log | done (rules) | `test_decide` |
 | `tlmc`: synth (incl. `--fp8` block-scale and `--dense-layers` checkpoints), compile passes 1–9 (exact / balanced / aggressive) over BF16/F16/F32 and FP8 E4M3 + 128×128 block-scale checkpoints, resume, REAP pruning with an eval gate, Q5_K demotion, heat-balanced placement with pins and replicas, report, atlas | done for Qwen3-MoE-like checkpoints (mixed dense + routed) | `tests/e2e.sh` (incl. the `synth --fp8` compile + run step; dense-prefix synth/compile/run) |
 | `tierlm`: run, bench, config show/check, missing-drive fallback to replicas | done | `tests/e2e.sh` |
+| M2 harness: `tools/m2_eval.sh STORE DRIVES OUT` — probe, per-drive `fio` baseline, expert-cache sweep, io/O_DIRECT A/B; writes `summary.json` (per-drive busy GiB/s, `gate` = min over drives of expert-read/fio, needs ≥ 0.85) and `table.md` | done; needs `jq`, `fio` for the gate; io_uring fallback to pread is recorded in the JSON | smoke run on the Qwen3-30B store (no fio there, gate null); `tierlm bench --stats-json` counters |
 
 Kernel throughput measured in the build container (single thread, AVX-512, -O2) was 20.4 GB/s for
 Q6_K, 17.2 GB/s for Q8_0 and 15.0 GB/s for Q4_K, counted as weight bytes per second. These are
