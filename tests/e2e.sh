@@ -27,6 +27,9 @@ run_logged() {             # run_logged LOG cmd... : keep output, show it on fai
     log=$1; shift
     if ! "$@" >"$log" 2>&1; then cat "$log" >&2; fail "$*"; fi
 }
+tokens_only() {             # keep only the printed tokens (drop stats, warns, drive lines)
+    grep -v -e '^--' -e '^[a-z]' -e '^  drive' -e 'tierlm warn' "$1"
+}
 
 step "synth a tiny Qwen3-MoE-like checkpoint"
 run_logged "$T/synth.log" "$B/tlmc" synth --out "$T/src" --layers 3 --experts 16 --top-k 2 --shared 1 --seed 7
@@ -47,14 +50,14 @@ P="Hello, tiered world"
 run_logged "$T/tiny.out" "$B/tierlm" run "$T/models/exact.tlmm" --prompt "$P" -n 24 --cache 1 --print-tokens --stats
 run_logged "$T/large.out" "$B/tierlm" run "$T/models/exact.tlmm" --prompt "$P" -n 24 --cache 1G --threads 1 \
     --prefetch off --print-tokens
-grep -v -e '^--' -e '^[a-z]' -e '^  drive' -e 'tierlm warn' "$T/tiny.out" > "$T/tiny.tok"
-cp "$T/large.out" "$T/large.tok"
-[ "$(wc -w < "$T/large.tok")" -eq 24 ] || fail "expected 24 tokens, got: $(cat "$T/large.tok")"
+tokens_only "$T/tiny.out" > "$T/tiny.tok"
+tokens_only "$T/large.out" > "$T/large.tok"
 cmp -s "$T/tiny.tok" "$T/large.tok" || { cat "$T/tiny.tok" "$T/large.tok" >&2; fail "tiny and large cache differ"; }
 grep -q "hit rate" "$T/tiny.out" || fail "--stats printed nothing"
 run_logged "$T/scalar.out" "$B/tierlm" run "$T/models/exact.tlmm" --prompt "$P" -n 24 --kernel scalar \
     --io io_uring --direct yes --print-tokens
-cmp -s "$T/scalar.out" "$T/large.tok" || fail "scalar kernel tier / io_uring request changed the tokens"
+tokens_only "$T/scalar.out" > "$T/scalar.tok"
+cmp -s "$T/scalar.tok" "$T/large.tok" || fail "scalar kernel tier / io_uring request changed the tokens"
 run_logged "$T/tok.out" "$B/tierlm" run "$T/models/exact.tlmm" --tokens 72,101,108 -n 4 --print-tokens
 [ "$(wc -w < "$T/tok.out")" -eq 4 ] || fail "--tokens run"
 run_logged "$T/bench.out" "$B/tierlm" bench "$T/models/exact.tlmm" --prompt-len 16 -n 16
@@ -78,8 +81,8 @@ run_logged "$T/fp8c.log" "$B/tlmc" compile "$T/src-fp8" --out "$T/models/fp8.tlm
 grep -q "bit-identical logits yes, greedy free run identical yes" "$T/fp8c.log" || fail "fp8 store not internally consistent"
 run_logged "$T/fp8t.out" "$B/tierlm" run "$T/models/fp8.tlmm" --prompt "$P" -n 16 --cache 1 --print-tokens
 run_logged "$T/fp8l.out" "$B/tierlm" run "$T/models/fp8.tlmm" --prompt "$P" -n 16 --print-tokens
-grep -v -e '^--' -e '^[a-z]' -e '^  drive' -e 'tierlm warn' "$T/fp8t.out" > "$T/fp8t.tok"
-cp "$T/fp8l.out" "$T/fp8l.tok"
+tokens_only "$T/fp8t.out" > "$T/fp8t.tok"
+tokens_only "$T/fp8l.out" > "$T/fp8l.tok"
 [ "$(wc -w < "$T/fp8l.tok")" -eq 16 ] || fail "expected 16 tokens from the fp8 store"
 cmp -s "$T/fp8t.tok" "$T/fp8l.tok" || { cat "$T/fp8t.tok" "$T/fp8l.tok" >&2; fail "fp8 store: tiny and large cache differ"; }
 
@@ -96,8 +99,8 @@ grep -q "21 packets on 3 drives" "$T/exactd.log" || fail "dense store has the wr
 run_logged "$T/dtiny.out" "$B/tierlm" run "$T/models/dense.tlmm" --prompt "$P" -n 24 --cache 1 --print-tokens --stats
 run_logged "$T/dlarge.out" "$B/tierlm" run "$T/models/dense.tlmm" --prompt "$P" -n 24 --cache 1G --threads 1 \
     --prefetch off --print-tokens
-grep -v -e '^--' -e '^[a-z]' -e '^  drive' -e 'tierlm warn' "$T/dtiny.out" > "$T/dtiny.tok"
-cp "$T/dlarge.out" "$T/dlarge.tok"
+tokens_only "$T/dtiny.out" > "$T/dtiny.tok"
+tokens_only "$T/dlarge.out" > "$T/dlarge.tok"
 [ "$(wc -w < "$T/dlarge.tok")" -eq 24 ] || fail "dense run gave $(wc -w < "$T/dlarge.tok") tokens, expected 24"
 cmp -s "$T/dtiny.tok" "$T/dlarge.tok" || { cat "$T/dtiny.tok" "$T/dlarge.tok" >&2; fail "dense: tiny and large cache differ"; }
 
@@ -106,7 +109,8 @@ run_logged "$T/exact2.log" "$B/tlmc" compile "$T/src" --out "$T/models/exact.tlm
 grep -q "reference store .*\[reused\]" "$T/exact2.log" || fail "pass 2 not reused"
 grep -q "calibrated on .*\[reused\]" "$T/exact2.log" || fail "pass 3 not reused"
 run_logged "$T/again.out" "$B/tierlm" run "$T/models/exact.tlmm" --prompt "$P" -n 24 --print-tokens
-cmp -s "$T/again.out" "$T/large.tok" || fail "recompiled store gives different tokens"
+tokens_only "$T/again.out" > "$T/again.tok"
+cmp -s "$T/again.tok" "$T/large.tok" || fail "recompiled store gives different tokens"
 
 step "compile (balanced): REAP pruning on a text corpus, gated"
 for f in docs/DISTILLED.md research/03-two-stage-design.md research/04-decision-engine.md; do
@@ -155,7 +159,6 @@ grep -q -e "^0:1 .*pruned" -e "^2:3 .*pruned" "$T/atlas-all.out" && fail "a prot
 step "run the pruned store (tiny vs large cache)"
 run_logged "$T/bt.out" "$B/tierlm" run "$T/models/bal.tlmm" --prompt "$P" -n 16 --cache 1 --print-tokens
 run_logged "$T/bl.out" "$B/tierlm" run "$T/models/bal.tlmm" --prompt "$P" -n 16 --print-tokens --stats
-tokens_only() { grep -v -e '^--' -e '^[a-z]' -e '^  drive' "$1"; }
 tokens_only "$T/bt.out" > "$T/bt.tok"
 tokens_only "$T/bl.out" > "$T/bl.tok"
 [ "$(wc -w < "$T/bl.tok")" -eq 16 ] || fail "expected 16 tokens from the pruned store"
@@ -176,7 +179,7 @@ S0=$(sed -n 's/^  drive 0 .* \([0-9][0-9]*\)% of expected expert reads$/\1/p' "$
 S1=$(sed -n 's/^  drive 1 .* \([0-9][0-9]*\)% of expected expert reads$/\1/p' "$T/agg.log")
 [ -n "$S0" ] && [ -n "$S1" ] && [ "$S1" -gt "$S0" ] || fail "placement ignored probed bandwidth ($S0% vs $S1%)"
 run_logged "$T/agg.out" "$B/tierlm" run "$T/models/agg.tlmm" --prompt "$P" -n 8 --print-tokens
-[ "$(wc -w < "$T/agg.out")" -eq 8 ] || fail "aggressive run"
+[ "$(tokens_only "$T/agg.out" | wc -w)" -eq 8 ] || fail "aggressive run"
 
 step "config show / check"
 printf 'cpu.threads = 2\nio.prefetch = off\n' > "$T/etc/tierlm.conf"

@@ -190,11 +190,13 @@ without writing with `--show`.
 ### Run the model: `tierlm run`
 
 ```sh
-./build/bin/tierlm run ~/stores/q30b.tlmm --prompt "Hello" -n 64 --stats
+./build/bin/tierlm run ~/stores/q30b.tlmm --tokenizer ~/models/Qwen3-30B-A3B --prompt "Hello" -n 64 --stats
 ```
 
-- `--prompt TEXT` — a text prompt (uses the built-in BPE tokenizer). Or `--tokens 1,2,3` for raw
-  ids from an external tokenizer.
+- `--tokenizer DIR` — the checkpoint directory (its `tokenizer.json`); **required for text** —
+  without it the prompt is read as raw bytes and the output shows `<id>` placeholders.
+- `--prompt TEXT` — a text prompt (BPE-encoded). Or `--tokens 1,2,3` for raw ids from an
+  external tokenizer.
 - `-n 64` — how many tokens to generate after the prompt.
 - `--stats` — per-drive reads, store hits/misses/evictions, prefetch issued/used/dropped, wait
   time. **This is where the M2 bandwidth numbers come from.**
@@ -204,6 +206,9 @@ without writing with `--show`.
 
 Every flag below changes **speed only, never the output**. That is the core guarantee of the
 engine, and it is what makes the M2 sweeps meaningful.
+The one exception is sampling: `--temp`, `--top-p`, `--min-p` and `--seed` change the output.
+The default is greedy, which loops on long generations (observed: paragraph repeated verbatim
+past ~256 tokens) — use `--temp 0.8` for longer outputs.
 
 | Flag | Meaning |
 | --- | --- |

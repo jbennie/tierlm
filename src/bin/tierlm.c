@@ -572,6 +572,10 @@ static int cmd_run(int argc, char **argv) {
         tbpe = tlm_bpe_load(o.tokenizer, err, sizeof err);
         if (!tbpe) die("--tokenizer: %s", err);
     }
+    if (!tbpe && o.prompt)
+        fprintf(stderr,
+                "warning: no --tokenizer: the prompt is read as raw bytes (1 token per byte) and "
+                "output falls back to <id> placeholders; pass --tokenizer <checkpoint dir> for text\n");
     runtime r;
     rt_open(&r, &o);
     const tlm_model_geom *g = tlm_model_geom_of(r.mdl);

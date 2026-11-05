@@ -22,7 +22,7 @@ clean tree. The code is about 16k lines of C in `src/`, plus 6k lines of tests.
 | BPE tokenizer: Qwen3 byte-level BPE (`tlm_bpe` encode/decode), NFC + Unicode tables, Qwen3 chat template, `--tokenizer` run wiring, and `tlmc compile --corpus` tokenisation (BPE when the source ships a `tokenizer.json`, else byte-level) | done | `test_bpe` (round-trip + HF parity on a mixed corpus); e2e (BPE vs byte corpus) |
 | Decision engine: Choice / Score / Noul questions, rules backend, SELF callback, confidence policy, JSONL audit log | done (rules) | `test_decide` |
 | `tlmc`: synth (incl. `--fp8` block-scale and `--dense-layers` checkpoints), compile passes 1–9 (exact / balanced / aggressive) over BF16/F16/F32 and FP8 E4M3 + 128×128 block-scale checkpoints, resume, REAP pruning with an eval gate, Q5_K demotion, heat-balanced placement with pins and replicas, report, atlas | done for Qwen3-MoE-like checkpoints (mixed dense + routed) | `tests/e2e.sh` (incl. the `synth --fp8` compile + run step; dense-prefix synth/compile/run) |
-| `tierlm`: run, bench (every `--stats` / `--stats-json` block is run-stamped: host, CPU, cores, RAM, OS, kernel, build git revision, store name/profile/geometry/source-sha — metric files are self-describing), config show/check, missing-drive fallback to replicas | done | `tests/e2e.sh` (stamp assertions on both text and JSON) |
+| `tierlm`: run (text I/O needs `--tokenizer <checkpoint dir>`; without it the prompt is raw bytes and output is `<id>` placeholders — now warns on stderr), bench (every `--stats` / `--stats-json` block is run-stamped: host, CPU, cores, RAM, OS, kernel, build git revision, store name/profile/geometry/source-sha — metric files are self-describing), config show/check, missing-drive fallback to replicas | done | `tests/e2e.sh` (stamp assertions on both text and JSON) |
 | M2 harness: `tools/m2_eval.sh STORE DRIVES OUT` — probe, per-drive `fio` baseline (libaio, depth 32), expert-cache sweep, io/O_DIRECT A/B; writes `summary.json` (per-drive wall GiB/s during decode, `gate` = min over drives of wall/fio, needs ≥ 0.85; the missiest run answers it) and `table.md` | done; needs `jq`, `fio` for the gate; io_uring fallback to pread is recorded in the JSON | doris run (gate 0.66 at 1 G, see M2 results); `tierlm bench --stats-json` counters |
 
 Kernel throughput measured in the build container (single thread, AVX-512, -O2) was 20.4 GB/s for
@@ -125,6 +125,11 @@ drive), so the 85% gate **fails on consumer Gen3 NVMe**: miss traffic is bursty 
 two thirds of raw sequential. A/B at 8 G: io_uring gives no gain (2.74 vs 2.88 tok/s vs pread;
 per-stream 0.30 vs 0.93 GiB/s) — the pread default stays; O_DIRECT on is worth ~5% (3.03 vs
 2.88 tok/s). Drogo (4 drives, 32 GB) is the outstanding half of M2.
+
+Live demo with real BPE text (`--tokenizer` on the checkpoint): a 256-token answer in 104 s —
+decode 3.4 tok/s, prefill 4.6 tok/s, 99% hit — produced a coherent, on-point paragraph (Q6_K
+quality is fine for real prose). Greedy sampling loops past ~256 tokens (paragraph repeated
+verbatim); `--temp 0.8` is the practical default for longer outputs.
 
 ## Decisions taken without asking
 
