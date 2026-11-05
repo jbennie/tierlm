@@ -1,6 +1,6 @@
 # Status
 
-Last updated 2026-11-04. This page is the hand-over point: read it before picking up work.
+Last updated 2026-11-05. This page is the hand-over point: read it before picking up work.
 
 ## What exists and is tested
 
@@ -23,11 +23,11 @@ clean tree. The code is about 16k lines of C in `src/`, plus 6k lines of tests.
 | Decision engine: Choice / Score / Noul questions, rules backend, SELF callback, confidence policy, JSONL audit log | done (rules) | `test_decide` |
 | `tlmc`: synth (incl. `--fp8` block-scale and `--dense-layers` checkpoints), compile passes 1–9 (exact / balanced / aggressive) over BF16/F16/F32 and FP8 E4M3 + 128×128 block-scale checkpoints, resume, REAP pruning with an eval gate, Q5_K demotion, heat-balanced placement with pins and replicas, report, atlas | done for Qwen3-MoE-like checkpoints (mixed dense + routed) | `tests/e2e.sh` (incl. the `synth --fp8` compile + run step; dense-prefix synth/compile/run) |
 | `tierlm`: run, bench (every `--stats` / `--stats-json` block is run-stamped: host, CPU, cores, RAM, OS, kernel, build git revision, store name/profile/geometry/source-sha — metric files are self-describing), config show/check, missing-drive fallback to replicas | done | `tests/e2e.sh` (stamp assertions on both text and JSON) |
-| M2 harness: `tools/m2_eval.sh STORE DRIVES OUT` — probe, per-drive `fio` baseline, expert-cache sweep, io/O_DIRECT A/B; writes `summary.json` (per-drive busy GiB/s, `gate` = min over drives of expert-read/fio, needs ≥ 0.85) and `table.md` | done; needs `jq`, `fio` for the gate; io_uring fallback to pread is recorded in the JSON | smoke run on the Qwen3-30B store (no fio there, gate null); `tierlm bench --stats-json` counters |
+| M2 harness: `tools/m2_eval.sh STORE DRIVES OUT` — probe, per-drive `fio` baseline (libaio, depth 32), expert-cache sweep, io/O_DIRECT A/B; writes `summary.json` (per-drive wall GiB/s during decode, `gate` = min over drives of wall/fio, needs ≥ 0.85; the missiest run answers it) and `table.md` | done; needs `jq`, `fio` for the gate; io_uring fallback to pread is recorded in the JSON | doris run (gate 0.66 at 1 G, see M2 results); `tierlm bench --stats-json` counters |
 
 Kernel throughput measured in the build container (single thread, AVX-512, -O2) was 20.4 GB/s for
 Q6_K, 17.2 GB/s for Q8_0 and 15.0 GB/s for Q4_K, counted as weight bytes per second. These are
-**not** WRX90 numbers. Nothing has been measured on the target machine yet.
+**not** WRX90 numbers. First target-machine measurements: doris (see M2 results below).
 
 ## Known gaps
 
@@ -108,11 +108,23 @@ tie-noise misses.
 | # | Milestone | Main work | Gate |
 | --- | --- | --- | --- |
 | **M1** ✅ | Real model bring-up | BPE tokenizer + chat template (P-127); FP8 block-scale ingest; dense-prefix layers; YaRN RoPE; teacher-forced oracle against HF transformers (P-121) on Qwen3-30B-A3B | per-position argmax matches the reference; tokenizer parity on a mixed corpus |
-| M2 | Measure on the M2 hosts — **drogo** (Ryzen 5 4500G 6C/12T Zen 2, 32 GB, 4× 1 TB NVMe on a 4-way PCIe 3.0 adapter) and **doris** (i7-6700HQ 4C/8T Skylake, 24 GB, 2× 256 GB Gen3 NVMe, Ubuntu 26.04); both AVX2, both multi-drive | portable `make URING=1` (identical build on both); `tlmc compile` Qwen3-30B-A3B (Q6_K experts + Q8_0 dense, ~28 GB); `tools/m2_eval.sh` per host: drogo sweep 1–16 G over 4 drives, doris sweep 1–12 G over 2 drives; io_uring vs pread and O_DIRECT A/B (C-02, C-03) | ≥ 85% of `fio` bandwidth on misses (per drive); decode tok/s recorded with hit rate; sharding/parallel-read/replica behaviour demonstrated on drogo and doris |
+| **M2** (doris ✅ 2026-11-05; drogo pending) | Measure on the M2 hosts — **drogo** (Ryzen 5 4500G 6C/12T Zen 2, 32 GB, 4× 1 TB NVMe on a 4-way PCIe 3.0 adapter) and **doris** (i7-6700HQ 4C/8T Skylake, 24 GB, 2× 256 GB Gen3 NVMe, Ubuntu 26.04); both AVX2, both multi-drive | portable `make URING=1` (identical build on both); `tlmc compile` Qwen3-30B-A3B (Q6_K experts + Q8_0 dense, ~28 GB); `tools/m2_eval.sh` per host: drogo sweep 1–16 G over 4 drives, doris sweep 1–12 G over 2 drives; io_uring vs pread and O_DIRECT A/B (C-02, C-03) | ≥ 85% of `fio` bandwidth on misses (per drive); decode tok/s recorded with hit rate; sharding/parallel-read/replica behaviour demonstrated on drogo and doris |
 | M3 | MTP speculation | MTP head packets (Q8_0, P-84); chain drafting with adaptive depth 0–4; batched verify; pause below 70% acceptance (P-85); expert-budget-aware draft length | output identical to non-speculative greedy; speed-up measured |
 | M4 | GPU KV on the R9700s | optional `dlopen` ROCm backend: Q/K/V shipped per layer, paged KV in ≤ 10% VRAM, CPU fallback | bit-for-bit vs the CPU KV at f32; context length vs `kv.vram_frac` |
 | M5 | Flagship family | MLA + compressed KV, native MXFP4 experts, DSA indexer (DeepSeek V4 Flash class) | teacher-forced match; ≥ 1 tok/s warm decode |
 | M6 | Cluster S0–S1 | `tlm_net` framing (P-128, P-129, P-135, P-137); prediction slaves over 10GbE; replica swarm work units | master output unchanged with or without slaves (P-131) |
+
+**doris results (2026-11-05, machine record in `m2out-doris/summary.json` on the host):**
+the store compiled in 59 min to 15.2 GiB per drive (50/50 expected-read split, 615 pinned +
+1844 replicated) and validated bit-identical against its reference. Decode at 99.3% hit (12 G
+cache) is **3.06 tok/s** on 4 Skylake cores; the cache sweep takes it 1.10 → 3.06 tok/s (hit
+46% → 99.3%) from 1 G to 12 G, and 8 G already reaches 93% of the 12 G speed. The gate —
+per-drive delivery on the missiest run vs fio (3.14/2.95 GiB/s) — is **0.66** (2.07 GiB/s per
+drive), so the 85% gate **fails on consumer Gen3 NVMe**: miss traffic is bursty (8 experts ×
+48 layers per token) and the drives idle between bursts, so end-to-end delivery sits at about
+two thirds of raw sequential. A/B at 8 G: io_uring gives no gain (2.74 vs 2.88 tok/s vs pread;
+per-stream 0.30 vs 0.93 GiB/s) — the pread default stays; O_DIRECT on is worth ~5% (3.03 vs
+2.88 tok/s). Drogo (4 drives, 32 GB) is the outstanding half of M2.
 
 ## Decisions taken without asking
 

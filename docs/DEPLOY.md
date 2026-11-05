@@ -248,8 +248,10 @@ All keys are documented in `etc/tierlm.conf.example`.
 ## 6. M2 measurement plan
 
 The **M2 gate is ≥ 85% of `fio` sequential-read bandwidth on expert misses**, with decode tok/s
-recorded at the hit rate. The whole sweep is one command — the harness runs the probe, the
-per-drive `fio` baseline, the cache-size sweep, and both A/B tests, then writes the gate:
+recorded at the hit rate. The gate is answered by the missiest run (smallest cache): per-drive
+aggregate delivery during decode (bytes / decode wall time) against that drive's fio baseline.
+The whole sweep is one command — the harness runs the probe, the per-drive `fio` baseline, the
+cache-size sweep, and both A/B tests, then writes the gate:
 
 ```sh
 # drogo — four drives; 32 GB RAM, so the sweep stops at 16G
@@ -266,8 +268,9 @@ The drive list must be in the store's manifest order (the gate indexes the fio b
 bench's drive index). Outputs land in the third argument:
 
 - `summary.json` — one object per run: the run-stamp `meta` (host, CPU, RAM, OS, build, store
-  identity), raw counters, per-drive expert-read GiB/s, the fio baseline, and `gate` = the
-  minimum over drives of (expert-read / fio). **`gate >= 0.85` passes.**
+  identity), raw counters, per-drive wall GiB/s (bytes delivered during decode) and stream
+  GiB/s (per-read latency figure), the fio baseline, and `gate` = the minimum over drives of
+  (wall GiB/s / fio GiB/s). **`gate >= 0.85` passes**; the missiest run answers it.
 - `table.md` — the sweep as a markdown table (tok/s, hit rate, per-drive bandwidth), headed by
   the host/CPU/build line so the file says where it came from.
 - `fio.txt`, `probe.txt`, `report.txt`, `bench/*.json` — the raw inputs, for re-deriving anything.
