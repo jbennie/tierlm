@@ -218,6 +218,7 @@ past ~256 tokens) — use `--temp 0.8` for longer outputs.
 | `--direct yes\|no` | O_DIRECT on/off (bypass the OS page cache). |
 | `--prefetch router\|off` | router-lookahead prefetch of the next layer's experts. |
 | `--lookahead-k N` | experts the router lookahead hints per layer (default: the model's top_k). Widen it to prefetch past the hard top-k; the runtime caps it at 4x top_k. |
+| `--interest F` | "this question needs" (0..1): how boldly to widen prefetch toward the interest; 0 = legacy fixed breadth. The instinct vector (learned) and model heat (calibrated) temper it. |
 | `--pin-frac F` | share of the cache held for the pinned hot set. |
 | `--kernel scalar\|avx2\|avx512` | force a SIMD tier (default: auto-picked at run time). |
 | `--warm FILE` | warm-start sidecar: bulk-load the hot set from a previous run. |

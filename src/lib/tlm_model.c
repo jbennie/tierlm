@@ -88,6 +88,9 @@ struct tlm_model {
     uint8_t       *meta_buf, *embed_buf;
     expert_info   *ex;           /* [n_layers * n_experts] */
     uint8_t       *mask;         /* 1 = pruned, [n_layers * n_experts] */
+    float         *layer_heat;    /* [n_layers] given heat (mean manifest loc.heat), 0..1 */
+    double        *instinct;      /* [n_layers] EMA of top-1 routed-mass share (learned) */
+    int           *instinct_seen; /* [n_layers] real-route observations */
     float         *inv_freq;     /* [head_dim / 2] (YaRN-corrected if configured) */
     float          rope_attn_scale;   /* cos/sin scale (1.0 unless YaRN) */
     float        **owned;        /* converted vectors to free */
@@ -511,14 +514,23 @@ tlm_model *tlm_model_open(const tlm_manifest *m, tlm_io *io, tlm_store *store, t
     M->o.lookahead_k = o && o->lookahead_k > 0 ? o->lookahead_k : (int)g->top_k;
     if (M->o.lookahead < 0) M->o.lookahead = 0;
     if (M->o.lookahead_k > (int)g->n_experts) M->o.lookahead_k = (int)g->n_experts;
+    M->o.interest = o ? o->interest : 0.0;
+    if (M->o.interest < 0.0) M->o.interest = 0.0;
+    if (M->o.interest > 1.0) M->o.interest = 1.0;
 
     int rc = TLM_OK;
     size_t nx = (size_t)g->n_layers * (g->n_experts ? g->n_experts : 1);
     M->L = (layer_w *)calloc(g->n_layers, sizeof *M->L);
     M->ex = (expert_info *)calloc(nx, sizeof *M->ex);
     M->mask = (uint8_t *)calloc(nx, 1);
+    M->layer_heat = (float *)calloc(g->n_layers, sizeof *M->layer_heat);
+    M->instinct = (double *)calloc(g->n_layers, sizeof *M->instinct);
+    M->instinct_seen = (int *)calloc(g->n_layers, sizeof *M->instinct_seen);
     M->inv_freq = track(M, g->head_dim / 2);
-    if (!M->L || !M->ex || !M->mask || !M->inv_freq) { rc = tlm_seterr(TLM_ENOMEM, "out of memory"); goto fail; }
+    if (!M->L || !M->ex || !M->mask || !M->layer_heat || !M->instinct || !M->instinct_seen || !M->inv_freq) {
+        rc = tlm_seterr(TLM_ENOMEM, "out of memory");
+        goto fail;
+    }
     for (uint32_t j = 0; j < g->head_dim / 2; j++)   /* F-fwd-03: built once, in double */
         M->inv_freq[j] = (float)pow((double)M->g.rope_theta, -2.0 * (double)j / (double)g->head_dim);
     M->rope_attn_scale = 1.0f;
@@ -530,6 +542,24 @@ tlm_model *tlm_model_open(const tlm_manifest *m, tlm_io *io, tlm_store *store, t
                                      g->rope_orig_len, M->g.rope_scale == 1, &af)))
             goto fail;
         M->rope_attn_scale = af;
+    }
+    {   /* given heat per layer ("my training tells me"): mean calibration
+         * selection frequency of the layer's experts, straight from the manifest */
+        double *sum = (double *)calloc(g->n_layers, sizeof *sum);
+        int *cnt = (int *)calloc(g->n_layers, sizeof *cnt);
+        if (sum && cnt) {
+            for (uint32_t i = 0; i < m->n_packets; i++) {
+                const tlm_packet_loc *p = &m->packets[i];
+                if (p->type == TLM_PK_EXPERT && p->layer < g->n_layers) {
+                    sum[p->layer] += p->heat;
+                    cnt[p->layer]++;
+                }
+            }
+            for (uint32_t l = 0; l < g->n_layers; l++)
+                M->layer_heat[l] = cnt[l] ? (float)(sum[l] / (double)cnt[l]) : 0.0f;
+        }
+        free(sum);
+        free(cnt);
     }
 
     for (uint32_t l = 0; l < g->n_layers && rc == TLM_OK; l++) rc = load_layer(M, m, (int)l);
@@ -572,6 +602,9 @@ void tlm_model_close(tlm_model *M) {
     free(M->L);
     free(M->ex);
     free(M->mask);
+    free(M->layer_heat);
+    free(M->instinct);
+    free(M->instinct_seen);
     free(M);
 }
 
@@ -822,6 +855,24 @@ static void lookahead(tlm_model *M, int l) {
     actc_set(&M->a_la, M->xb2);
     router_logits(M, l, &M->a_la, M->rl);
     route(M, l, M->rl, k, ids, w);
+    /* Three-term navigation weight (docs/design/navigation.md):
+     * W = alpha * (1 - I) * (1 - H). alpha = "this question needs"
+     * (nav.interest_aggressiveness); I = instinct vector (learned + current
+     * peakedness); H = model heat (given). alpha == 0 is the legacy fixed-
+     * breadth path. Prefetch breadth never changes output (P-34). */
+    if (M->o.interest > 0.0 && k > (int)g->top_k) {
+        double s = 0.0;
+        for (int r = 0; r < k; r++) s += (double)w[r];
+        double now = s > 0.0 ? (double)w[0] / s : 0.0;
+        double I = (M->instinct_seen && M->instinct_seen[l]) ? 0.5 * (now + M->instinct[l]) : now;
+        double H = M->layer_heat ? (double)M->layer_heat[l] : 0.0;
+        double W = M->o.interest * (1.0 - I) * (1.0 - H);
+        if (W < 0.0) W = 0.0;
+        if (W > 1.0) W = 1.0;
+        int span = k - (int)g->top_k;
+        k = (int)g->top_k + (int)(W * (double)span + 0.5);
+        if (k > (int)g->n_experts) k = (int)g->n_experts;
+    }
     tlm_store_prefetch(M->store, l, ids, k);
 }
 
@@ -920,6 +971,13 @@ static int moe(tlm_model *M, int l, int pos, int token) {
     if (g->n_experts > 0) {
         router_logits(M, l, &M->a_ffn, M->rl);
         route(M, l, M->rl, k, ids, w);
+        if (M->instinct_seen) {
+            double s = 0.0;
+            for (int r = 0; r < k; r++) s += (double)w[r];
+            double share = s > 0.0 ? (double)w[0] / s : 0.0;
+            M->instinct[l] += (share - M->instinct[l]) * 0.05;
+            M->instinct_seen[l]++;
+        }
         memset(refs, 0, sizeof refs);
         for (int r = 0; r < k; r++) refs[r].slot = -1;
         rc = tlm_store_acquire(M->store, l, ids, k, refs);

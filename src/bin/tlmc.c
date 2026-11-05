@@ -543,7 +543,7 @@ static int rtm_open(rtm *r, const char *mpath, tlm_pool *pool) {
     so.prefetch = 1;
     r->st = tlm_store_open(&r->m, r->io, &so);
     if (!r->st) { rc = TLM_ENOMEM; goto fail; }
-    tlm_model_opts mo = {1, 0};
+    tlm_model_opts mo = {1, 0, 0.0};
     r->mdl = tlm_model_open(&r->m, r->io, r->st, pool, &mo);
     if (!r->mdl) { rc = TLM_EFORMAT; goto fail; }
     return TLM_OK;

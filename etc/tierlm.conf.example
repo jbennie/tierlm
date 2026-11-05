@@ -35,6 +35,9 @@ io.drives                =             # expert store mount points, e.g. /srv/tl
 io.prefetch              = router      # router | off: prefetch layer l+1's experts from its router
 io.lookahead_k           = 0           # experts hinted per layer by the router lookahead; 0 = top_k
 
+# -- Navigation (docs/design/navigation.md) -------------------------------
+nav.interest_aggressiveness = 0.0       # "this question needs"; 0 = legacy fixed prefetch breadth
+
 # -- KV cache ----------------------------------------------------------
 kv.device                = cpu         # cpu, or GPUs such as hip:0, hip:1 (layers split across them)
 kv.vram_frac             = 0.05        # share of each GPU's VRAM for KV pages; hard cap 0.10

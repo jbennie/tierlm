@@ -43,6 +43,10 @@ const tlm_cfg_key tlm_cfg_schema[] = {
     {"io.prefetch", TLM_CFG_ENUM, "router", NR, "router|off", "prefetch layer l+1 experts from its router run on layer l's output"},
     {"io.lookahead_k", TLM_CFG_INT, "0", 0, 256, NULL, "experts hinted per layer by the router lookahead (0 = top_k)"},
 
+    /* navigation (docs/design/navigation.md) */
+    {"nav.interest_aggressiveness", TLM_CFG_FRAC, "0.0", 0, 1, NULL,
+     "\"this question needs\": how boldly to widen prefetch toward the interest; 0 = legacy fixed breadth"},
+
     /* KV cache */
     {"kv.device", TLM_CFG_LIST, "cpu", NR, NULL, "KV cache placement: cpu, or GPUs such as hip:0, hip:1"},
     {"kv.vram_frac", TLM_CFG_FRAC, "0.05", 0, 0.10, NULL, "share of each GPU's VRAM for KV pages (hard cap 0.10)"},

@@ -28,6 +28,7 @@ typedef struct tlm_model tlm_model;
 typedef struct {
     int lookahead;       /* router-lookahead prefetch depth in layers (0 = off, 1 default) */
     int lookahead_k;     /* experts to hint per layer (default top_k) */
+    double interest;     /* nav.interest_aggressiveness: "this question needs" (0 = legacy fixed breadth) */
 } tlm_model_opts;
 
 /* Loads every DENSE/META/EMBED packet into RAM (verified). The store serves

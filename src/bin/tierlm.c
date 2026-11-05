@@ -99,7 +99,7 @@ static int runtime_flag(opts *o, int argc, char **argv, int *i) {
     static const struct { const char *flag, *key; } map[] = {
         {"--cache", "memory.expert_cache"}, {"--threads", "cpu.threads"}, {"--io", "io.backend"},
         {"--direct", "io.direct"},          {"--prefetch", "io.prefetch"}, {"--lookahead-k", "io.lookahead_k"},
-        {"--pin-frac", "memory.pin_frac"},
+        {"--pin-frac", "memory.pin_frac"}, {"--interest", "nav.interest_aggressiveness"},
     };
     for (size_t k = 0; k < sizeof map / sizeof map[0]; k++)
         if (!strcmp(argv[*i], map[k].flag)) {
@@ -294,7 +294,7 @@ static void rt_open(runtime *r, opts *o) {
     if (tlm_store_warm(r->st)) die("%s", tlm_errmsg());
     r->lookahead = so.prefetch ? 1 : 0;
     r->lookahead_k = (int)tlm_cfg_int(o->cfg, "io.lookahead_k", 0);
-    tlm_model_opts mo = {r->lookahead, r->lookahead_k};
+    tlm_model_opts mo = {r->lookahead, r->lookahead_k, tlm_cfg_frac(o->cfg, "nav.interest_aggressiveness", 0.0)};
     r->mdl = tlm_model_open(&r->m, r->io, r->st, r->pool, &mo);
     if (!r->mdl) die("%s", tlm_errmsg());
     r->load_s = (double)(tlm_now_ns() - t0) * 1e-9;
@@ -788,8 +788,8 @@ static void usage(FILE *f) {
             "tierlm %s - tiered MoE runtime\n"
             "  tierlm run   MANIFEST [--prompt TEXT | --tokens 1,2,3] [-n 32] [--temp 0] [--top-p P]\n"
             "               [--min-p P] [--seed N] [--cache SIZE] [--threads N] [--io pread|io_uring]\n"
-            "               [--direct yes|no] [--prefetch router|off] [--lookahead-k N] [--pin-frac F]\n"
-            "               [--warm FILE] [--kernel scalar|avx2|avx512] [--stats] [--etc DIR]\n"
+            "               [--direct yes|no] [--prefetch router|off] [--lookahead-k N] [--interest F]\n"
+            "               [--pin-frac F] [--warm FILE] [--kernel scalar|avx2|avx512] [--stats] [--etc DIR]\n"
             "               [--print-tokens]\n"
             "  tierlm bench MANIFEST [--prompt-len N] [-n N] [runtime flags as for run]\n"
             "  tierlm oracle MANIFEST --tokens 1,2,3   (per-position top-k dump, P-121)\n"

@@ -459,7 +459,7 @@ typedef struct {
     tlm_model   *mdl;
 } rt;
 
-typedef struct { int threads; uint64_t budget_slots; int prefetch; double pin_frac; int lookahead_k; } rt_cfg;
+typedef struct { int threads; uint64_t budget_slots; int prefetch; double pin_frac; int lookahead_k; double interest; } rt_cfg;
 
 static int rt_open(rt *r, const synth *S, const rt_cfg *c) {
     memset(r, 0, sizeof *r);
@@ -482,7 +482,7 @@ static int rt_open(rt *r, const synth *S, const rt_cfg *c) {
     if (!r->store) return -1;
     if (c->pin_frac > 0 && tlm_store_warm(r->store)) return -1;
     r->pool = c->threads > 1 ? tlm_pool_new(c->threads, 0) : NULL;
-    tlm_model_opts mo = {c->prefetch ? 1 : 0, c->lookahead_k};
+    tlm_model_opts mo = {c->prefetch ? 1 : 0, c->lookahead_k, c->interest};
     r->mdl = tlm_model_open(&r->m, r->io, r->store, r->pool, &mo);
     return r->mdl ? 0 : -1;
 }
@@ -682,13 +682,13 @@ static void test_yarn_reference(void) {
  * base is the 1-thread no-prefetch trace */
 static void inv_matrix(const synth *S, const spec *s, rt *r, const trace *base, int V) {
     rt_cfg cfgs[] = {
-        {2, 64, 0, 0.0, 0},              /* threads */
-        {4, 64, 0, 0.0, 0},
-        {3, 64, 1, 0.5, 0},              /* resident + pinned + prefetch */
-        {1, (uint64_t)s->K, 0, 0.0, 0},  /* minimal cache: top_k slots, constant eviction */
-        {4, (uint64_t)s->K, 1, 0.0, 0},  /* minimal cache with prefetch (hints mostly dropped) */
-        {2, (uint64_t)s->K + 2, 1, 0.0, 6}, /* small cache, aggressive lookahead */
-        {2, 9, 1, 0.3, 0},               /* partial cache with pins */
+        {2, 64, 0, 0.0, 0, 0.0},           /* threads */
+        {4, 64, 0, 0.0, 0, 0.0},
+        {3, 64, 1, 0.5, 0, 0.0},           /* resident + pinned + prefetch */
+        {1, (uint64_t)s->K, 0, 0.0, 0, 0.0}, /* minimal cache: top_k slots, constant eviction */
+        {4, (uint64_t)s->K, 1, 0.0, 0, 0.0},    /* minimal cache with prefetch (hints mostly dropped) */
+        {2, (uint64_t)s->K + 2, 1, 0.0, 6, 0.5}, /* small cache, aggressive lookahead + interest weight */
+        {2, 9, 1, 0.3, 0, 0.0},                 /* partial cache with pins */
     };
     for (size_t i = 0; i < sizeof cfgs / sizeof cfgs[0]; i++) {
         trace t;
@@ -836,13 +836,13 @@ static void test_dense_prefix(void) {
     for (int i = 0; i < NSTEP * V; i++) n_finite += isfinite(base.logits[i]) != 0;
     CHECK_EQ_INT(n_finite, NSTEP * V);
     const rt_cfg cfgs[] = {
-        {2, 64, 0, 0.0, 0},              /* threads */
-        {4, 64, 0, 0.0, 0},
-        {3, 64, 1, 0.5, 0},              /* resident + pinned + prefetch */
-        {1, (uint64_t)s.K, 0, 0.0, 0},   /* minimal cache: top_k slots */
-        {4, (uint64_t)s.K, 1, 0.0, 0},   /* minimal cache with prefetch */
-        {2, (uint64_t)s.K + 2, 1, 0.0, 6}, /* small cache, aggressive lookahead */
-        {2, 9, 1, 0.3, 0},               /* partial cache with pins */
+        {2, 64, 0, 0.0, 0, 0.0},           /* threads */
+        {4, 64, 0, 0.0, 0, 0.0},
+        {3, 64, 1, 0.5, 0, 0.0},           /* resident + pinned + prefetch */
+        {1, (uint64_t)s.K, 0, 0.0, 0, 0.0}, /* minimal cache: top_k slots */
+        {4, (uint64_t)s.K, 1, 0.0, 0, 0.0},    /* minimal cache with prefetch */
+        {2, (uint64_t)s.K + 2, 1, 0.0, 6, 0.5}, /* small cache, aggressive lookahead + interest weight */
+        {2, 9, 1, 0.3, 0, 0.0},                /* partial cache with pins */
     };
     for (size_t i = 0; i < sizeof cfgs / sizeof cfgs[0]; i++) {
         trace t;
