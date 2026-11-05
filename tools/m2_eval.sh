@@ -5,14 +5,17 @@
 # fixed size) on a compiled store, then emits a machine-readable summary for the
 # M2 gate:
 #
-#     gate = per-drive expert-read bandwidth / that drive's raw fio sequential
-#            read bandwidth                      (need >= 0.85)
+#     gate = per-drive aggregate expert-read delivery during decode
+#            / that drive's raw fio sequential read bandwidth   (need >= 0.85)
 #
-# Expert-read bandwidth comes from the runtime's own counters: each drive reports
-# the bytes it read and the wall time it spent reading (busy_ns), so per-drive
-# GiB/s = bytes / busy_ns. That is the bandwidth the drive actually delivered to
-# the runtime - the quantity to compare against fio (which measures the same
-# drive's raw sequential-read bandwidth). GiB/s here = 2^30 bytes/s.
+# Aggregate delivery comes from the runtime's own counters: each drive reports
+# the bytes it read, so per-drive GiB/s = bytes / decode wall time. That is the
+# bandwidth the store actually fed the model from that drive - the quantity to
+# compare against fio (the same drive's raw sequential-read bandwidth).
+# busy_ns is the SUMMED per-read wall time (up to 4 pread workers or qd
+# uring requests in flight at once), so bytes/busy_ns is a per-stream latency
+# figure: reported as stream_gibs for diagnosis, not used for the gate.
+# GiB/s here = 2^30 bytes/s.
 #
 #     tools/m2_eval.sh STORE DRIVES OUT
 #
@@ -128,17 +131,16 @@ say "writing summary.json"
         name=$(basename "$f" .json)
         if [ "$first" = 1 ]; then first=0; else echo ','; fi
         jq -c --arg name "$name" --argjson fio "$FIO_GIBS_JSON" '
-            def gibs($b; $ns): if $ns > 0 then ($b * 8) / ($ns * 1e-9) / 1073741824 else 0 end;
+            def gibs($b; $s): if $s > 0 then $b / ($s * 1073741824) else 0 end;
             . as $s
             | ($s.io.drives | map(.busy_ns) | add // 0) as $busy
             | ($s.io.drives | map(.bytes)   | add // 0) as $bytes
             | (if ($s.decode_tok_s // 0) > 0 and ($s.generated // 0) > 1
                then ($s.generated - 1) / $s.decode_tok_s else 0 end) as $dec_s
             | ($s.io.drives | to_entries
-               | map(select(.value.busy_ns > 0)
-                     | { b: (.value.bytes * 8 / 1073741824 / (.value.busy_ns * 1e-9)),
-                         f: ($fio[(.key | tostring)] // null) })
-               | map(select(.f != null and .f > 0) | (.b / .f))
+               | map({ b: (if $dec_s > 0 then .value.bytes / ($dec_s * 1073741824) else 0 end),
+                       f: ($fio[(.key | tostring)] // null) })
+               | map(select(.f != null and .f > 0 and .b > 0) | (.b / .f))
                | if length > 0 then min else null end) as $gate
             | {
                 name: $name,
@@ -149,14 +151,14 @@ say "writing summary.json"
                 misses: $s.store.misses,
                 bytes_read: $s.store.bytes_read,
                 busy_ns: $busy,
-                busy_gibs: gibs($bytes; $busy),
+                stream_gibs: (if $busy > 0 then $bytes / ($busy * 1e-9 * 1073741824) else 0 end),
                 decode_s: $dec_s,
-                eff_gibs: gibs($bytes; $dec_s * 1e9),
+                wall_gibs: gibs($bytes; $dec_s),
                 backend: $s.io.backend,
                 gate: $gate,
                 drives: ($s.io.drives | to_entries | map({ index: .key, reads: .value.reads,
                           bytes: .value.bytes, busy_ns: .value.busy_ns,
-                          gibs: gibs(.value.bytes; .value.busy_ns) }))
+                          wall_gibs: (if $dec_s > 0 then .value.bytes / ($dec_s * 1073741824) else 0 end) }))
               }' "$f"
     done
     echo ']'
@@ -171,9 +173,9 @@ say "writing table.md"
     jq -r '.[0].meta // empty
         | "host: \(.host) — \(.cpu), \(.cores) cores / \(.cpus) cpus, \(.ram_gib) GiB RAM, \(.os) \(.kernel), build \(.version) \(.build), store \(.store.name) (\(.store.profile), sha \(.store.source_sha256[0:12]))"' \
         "$OUT/summary.json"
-    printf '\ndecode tok/s and hit rate across the expert-cache sweep, with the per-drive expert-read bandwidth and the gate\n'
-    printf '(busy GiB/s / fio GiB/s; needs to be >= 0.85). GiB = 2^30 bytes.\n\n'
-    printf '| run | decode tok/s | hit %% | misses | read GiB | busy GiB/s | eff GiB/s | backend | gate |\n'
+    printf '\ndecode tok/s and hit rate across the expert-cache sweep, with per-drive expert-read delivery and the gate\n'
+    printf '(min over drives of wall GiB/s / fio GiB/s; needs to be >= 0.85). GiB = 2^30 bytes.\n\n'
+    printf '| run | decode tok/s | hit %% | misses | read GiB | wall GiB/s | stream GiB/s | backend | gate |\n'
     printf '|---|---|---|---|---|---|---|---|---|\n'
     jq -r '.[]
         | [.name,
@@ -181,8 +183,8 @@ say "writing table.md"
            ((.hit_rate) | (.*100 | floor / 100 | tostring)),
            (.misses | tostring),
            ((.bytes_read / 1073741824) | (.*100 | floor / 100 | tostring)),
-           ((.busy_gibs) | (.*1000 | floor / 1000 | tostring)),
-           ((.eff_gibs) | (.*1000 | floor / 1000 | tostring)),
+           ((.wall_gibs) | (.*1000 | floor / 1000 | tostring)),
+           ((.stream_gibs) | (.*1000 | floor / 1000 | tostring)),
            .backend,
            (if .gate == null then "n/a (no fio)" else (.gate | (.*100 | floor / 100 | tostring)) end)]
         | "| " + join(" | ") + " |"' "$OUT/summary.json"
