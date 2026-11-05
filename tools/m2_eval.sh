@@ -84,12 +84,17 @@ if [ "$FIO_RUNTIME" != 0 ] && command -v fio >/dev/null 2>&1; then
     idx=0
     for d in "${DRV[@]}"; do
         if [ -d "$d" ]; then
+            # libaio is required: fio's default sync engine silently caps the
+            # queue depth at 1, and its warning line corrupts the JSON on
+            # stdout (the gate then parses 0). The per-drive --output file and
+            # the grep guard make the parse robust either way.
             fio --name="m2-$(basename "$d")" --directory="$d" --rw=read --bs=4m --direct=1 \
-                --iodepth=32 --numjobs=1 --size=8G --runtime="$FIO_RUNTIME" --time_based \
-                --group_reporting --output-format=json >> "$OUT/fio.txt" 2>&1
-            kib=$(jq -s '[.[] | .jobs[0].read.bw] | last // 0' "$OUT/fio.txt" 2>/dev/null || echo 0)
+                --ioengine=libaio --iodepth=32 --numjobs=1 --size=8G --runtime="$FIO_RUNTIME" --time_based \
+                --group_reporting --output-format=json --output="$OUT/fio.$idx.json" >> "$OUT/fio.txt" 2>&1
+            kib=$(grep -v '^note:' "$OUT/fio.$idx.json" 2>/dev/null | jq -r '.jobs[0].read.bw // 0' || echo 0)
             gibs=$(awk -v k="$kib" 'BEGIN{printf "%.3f", k*1024/1073741824}')
             FIO_GIBS_JSON=$(jq -c --arg k "$idx" --argjson v "$gibs" '. + {($k): $v}' <<< "$FIO_GIBS_JSON")
+            [ "$gibs" = "0.000" ] && say "WARNING: fio reported 0 GiB/s for $d (see $OUT/fio.txt); the gate will be null"
         else
             say "fio: skip missing dir $d"
         fi
