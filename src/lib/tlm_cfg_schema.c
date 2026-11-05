@@ -41,6 +41,7 @@ const tlm_cfg_key tlm_cfg_schema[] = {
     {"io.threads_per_drive", TLM_CFG_INT, "4", 1, 256, NULL, "pread workers per drive"},
     {"io.drives", TLM_CFG_LIST, "", NR, NULL, "expert store mount points, one per NVMe drive"},
     {"io.prefetch", TLM_CFG_ENUM, "router", NR, "router|off", "prefetch layer l+1 experts from its router run on layer l's output"},
+    {"io.lookahead_k", TLM_CFG_INT, "0", 0, 256, NULL, "experts hinted per layer by the router lookahead (0 = top_k)"},
 
     /* KV cache */
     {"kv.device", TLM_CFG_LIST, "cpu", NR, NULL, "KV cache placement: cpu, or GPUs such as hip:0, hip:1"},

@@ -217,6 +217,7 @@ past ~256 tokens) — use `--temp 0.8` for longer outputs.
 | `--io pread\|io_uring` | I/O backend. |
 | `--direct yes\|no` | O_DIRECT on/off (bypass the OS page cache). |
 | `--prefetch router\|off` | router-lookahead prefetch of the next layer's experts. |
+| `--lookahead-k N` | experts the router lookahead hints per layer (default: the model's top_k). Widen it to prefetch past the hard top-k; the runtime caps it at 4x top_k. |
 | `--pin-frac F` | share of the cache held for the pinned hot set. |
 | `--kernel scalar\|avx2\|avx512` | force a SIMD tier (default: auto-picked at run time). |
 | `--warm FILE` | warm-start sidecar: bulk-load the hot set from a previous run. |

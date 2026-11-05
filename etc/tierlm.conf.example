@@ -33,6 +33,7 @@ io.queue_depth           = 32          # outstanding reads per drive (io_uring),
 io.threads_per_drive     = 4           # pread workers per drive, 1..256
 io.drives                =             # expert store mount points, e.g. /srv/tlm/nvme0, /srv/tlm/nvme1
 io.prefetch              = router      # router | off: prefetch layer l+1's experts from its router
+io.lookahead_k           = 0           # experts hinted per layer by the router lookahead; 0 = top_k
 
 # -- KV cache ----------------------------------------------------------
 kv.device                = cpu         # cpu, or GPUs such as hip:0, hip:1 (layers split across them)

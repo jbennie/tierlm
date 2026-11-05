@@ -98,7 +98,8 @@ typedef struct {
 static int runtime_flag(opts *o, int argc, char **argv, int *i) {
     static const struct { const char *flag, *key; } map[] = {
         {"--cache", "memory.expert_cache"}, {"--threads", "cpu.threads"}, {"--io", "io.backend"},
-        {"--direct", "io.direct"},          {"--prefetch", "io.prefetch"}, {"--pin-frac", "memory.pin_frac"},
+        {"--direct", "io.direct"},          {"--prefetch", "io.prefetch"}, {"--lookahead-k", "io.lookahead_k"},
+        {"--pin-frac", "memory.pin_frac"},
     };
     for (size_t k = 0; k < sizeof map / sizeof map[0]; k++)
         if (!strcmp(argv[*i], map[k].flag)) {
@@ -171,7 +172,7 @@ typedef struct {
     tlm_model   *mdl;
     uint64_t     budget, slot, expert_total;
     double       pin_frac;
-    int          threads, lookahead, missing;
+    int          threads, lookahead, lookahead_k, missing;
     double       load_s;
 } runtime;
 
@@ -292,7 +293,8 @@ static void rt_open(runtime *r, opts *o) {
     if (!r->st) die("%s", tlm_errmsg());
     if (tlm_store_warm(r->st)) die("%s", tlm_errmsg());
     r->lookahead = so.prefetch ? 1 : 0;
-    tlm_model_opts mo = {r->lookahead, 0};
+    r->lookahead_k = (int)tlm_cfg_int(o->cfg, "io.lookahead_k", 0);
+    tlm_model_opts mo = {r->lookahead, r->lookahead_k};
     r->mdl = tlm_model_open(&r->m, r->io, r->st, r->pool, &mo);
     if (!r->mdl) die("%s", tlm_errmsg());
     r->load_s = (double)(tlm_now_ns() - t0) * 1e-9;
@@ -432,7 +434,16 @@ static void print_stats(runtime *r, FILE *f, int n_prompt, int n_gen, double pre
     fprintf(f, "store       hits %llu, misses %llu (hit rate %.1f%%), evictions %llu, read %s, wait %.3f ms\n",
             (unsigned long long)ss.hits, (unsigned long long)ss.misses, acc ? 100.0 * ss.hits / acc : 100.0,
             (unsigned long long)ss.evictions, b1, ss.wait_ns * 1e-6);
-    fprintf(f, "prefetch    %s: issued %llu, used %llu, dropped %llu\n", r->lookahead ? "router lookahead" : "off",
+    char pmode[40];
+    if (r->lookahead) {
+        if (r->lookahead_k > 0)
+            snprintf(pmode, sizeof pmode, "router lookahead (k=%d)", r->lookahead_k);
+        else
+            snprintf(pmode, sizeof pmode, "router lookahead");
+    } else {
+        snprintf(pmode, sizeof pmode, "off");
+    }
+    fprintf(f, "prefetch    %s: issued %llu, used %llu, dropped %llu\n", pmode,
             (unsigned long long)ss.prefetch_issued, (unsigned long long)ss.prefetch_used,
             (unsigned long long)ss.prefetch_dropped);
     fprintf(f, "io          backend %s%s\n", tlm_io_backend_name(r->io), r->missing ? " (running from replicas)" : "");
@@ -777,8 +788,9 @@ static void usage(FILE *f) {
             "tierlm %s - tiered MoE runtime\n"
             "  tierlm run   MANIFEST [--prompt TEXT | --tokens 1,2,3] [-n 32] [--temp 0] [--top-p P]\n"
             "               [--min-p P] [--seed N] [--cache SIZE] [--threads N] [--io pread|io_uring]\n"
-            "               [--direct yes|no] [--prefetch router|off] [--pin-frac F] [--warm FILE]\n"
-            "               [--kernel scalar|avx2|avx512] [--stats] [--etc DIR] [--print-tokens]\n"
+            "               [--direct yes|no] [--prefetch router|off] [--lookahead-k N] [--pin-frac F]\n"
+            "               [--warm FILE] [--kernel scalar|avx2|avx512] [--stats] [--etc DIR]\n"
+            "               [--print-tokens]\n"
             "  tierlm bench MANIFEST [--prompt-len N] [-n N] [runtime flags as for run]\n"
             "  tierlm oracle MANIFEST --tokens 1,2,3   (per-position top-k dump, P-121)\n"
             "  tierlm config show [--origin] [--etc DIR]\n"
