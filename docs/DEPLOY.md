@@ -25,19 +25,21 @@ The repo builds to three binaries, all under `build/bin/`:
 
 ### The M2 test hosts (drogo, doris)
 
-Two modest AVX2 hosts on RHEL 10.3. The GPUs are not part of M2 — the CPU path is what is
-measured (drogo's 2080 Ti is removed to make room for the 4-way NVMe adapter).
+Two modest AVX2 hosts — doris on Ubuntu 26.04, drogo on RHEL 10.3. The GPUs are not part of
+M2 — the CPU path is what is measured (drogo's 2080 Ti is removed to make room for the 4-way
+NVMe adapter).
 
 | | drogo | doris |
 | --- | --- | --- |
-| CPU | AMD Ryzen 5 4500G — 6C/12T Zen 2, AVX2 (no VNNI, no AVX-512) | Intel Xeon E5-2630 v3 — 8C/16T Haswell, AVX2 (no VNNI, no AVX-512) |
-| RAM | 32 GB DDR4 UDIMM → cache sweep caps at ~16 G | 64 GB DDR4-2133 RDIMM → sweep to 32 G |
-| Disk | **4× 1 TB NVMe** on a 4-way PCIe adapter | 1× 256 GB NVMe |
+| CPU | AMD Ryzen 5 4500G — 6C/12T Zen 2, AVX2 (no VNNI, no AVX-512) | Intel Core i7-6700HQ — 4C/8T Skylake, AVX2 (no VNNI, no AVX-512) |
+| RAM | 32 GB DDR4 UDIMM → cache sweep caps at ~16 G | 24 GB DDR4 → sweep to 12 G |
+| Disk | **4× 1 TB NVMe** on a 4-way PCIe adapter | 2× 256 GB NVMe (Gen3) |
 | GPU | (removed) | WX3100 8 GB — unused in M2 |
 
-**drogo is the multi-drive host**: it exercises drive sharding, parallel reads and replica
-queue-wins. doris is the single-drive comparison, and the two boxes together give a
-CPU-generation and RAM comparison (Zen 2 dual-channel, 32 G vs Haswell, 64 G cache).
+**Both hosts are multi-drive**: drogo (4 drives) exercises drive sharding, parallel reads and
+replica queue-wins at full width; doris (2 drives) covers the same path at two-way. Together
+they give a CPU-generation and RAM comparison (Zen 2 dual-channel, 32 G vs Skylake, 24 G
+cache).
 
 drogo caveats:
 
@@ -54,15 +56,20 @@ Two things set the speed, in this order: **RAM for the expert cache is the bigge
 bandwidth is second.** Total parameter count barely matters — a MoE touches only a few percent of
 its weights per token. Plan the cache and the drives around that.
 
-## 2. Prerequisites — RHEL 10.3, no GPU
+## 2. Prerequisites — RHEL 10.3 / Ubuntu 26.04, no GPU
 
-On a clean RHEL 10.3 install the only build dependencies are a C compiler and `make` (plus
-optional `liburing`). There is **no** CMake, **no** Python at build or run time, and **no**
-third-party C library. Install:
+On a clean install the only build dependencies are a C compiler and `make` (plus optional
+`liburing`). There is **no** CMake, **no** Python at build or run time, and **no** third-party
+C library. Install:
 
 ```sh
+# RHEL 10.3 (drogo)
 sudo dnf install gcc make git
 sudo dnf install liburing-devel        # optional: enables the io_uring backend (make URING=1)
+
+# Ubuntu 26.04 (doris)
+sudo apt install -y gcc make git
+sudo apt install -y liburing-dev        # optional: enables the io_uring backend (make URING=1)
 ```
 
 - `gcc` on RHEL 10 is GCC 14; the portable build needs nothing newer (no tuned `-march`).
@@ -80,6 +87,9 @@ sudo grubby --update-kernel=ALL --args="kernel.io_uring_disabled=0"
 sudo reboot
 # verify: cat /proc/sys/kernel/io_uring_disabled    # want 0
 ```
+
+On Ubuntu (doris) io_uring is on by default — verify with the same `cat
+/proc/sys/kernel/io_uring_disabled` (want `0`) and skip the grubby step.
 
 ## 3. Clone and build
 
@@ -128,10 +138,10 @@ source.) Download the HF checkpoint first (57 GB), then compile per host:
     --drives /mnt/nvme0/q30b,/mnt/nvme1/q30b,/mnt/nvme2/q30b,/mnt/nvme3/q30b \
     --profile exact --experts q6_k --dense q8_0 --replicas auto
 
-# doris — one drive
+# doris — two drives
 ./build/bin/tlmc compile /path/to/Qwen3-30B-A3B \
     --out  ~/stores/q30b.tlmm \
-    --drives /mnt/nvme/q30b \
+    --drives /mnt/nvme0/q30b,/mnt/nvme1/q30b \
     --profile exact --experts q6_k --dense q8_0 --replicas auto
 ```
 
@@ -247,9 +257,9 @@ CACHE_LIST="1G 4G 8G 16G" AB_CACHE=8G \
     tools/m2_eval.sh ~/stores/q30b.tlmm \
     /mnt/nvme0/q30b,/mnt/nvme1/q30b,/mnt/nvme2/q30b,/mnt/nvme3/q30b m2out-drogo
 
-# doris — one drive; 64 GB RAM, sweep to 32G
-CACHE_LIST="1G 4G 8G 16G 32G" AB_CACHE=16G \
-    tools/m2_eval.sh ~/stores/q30b.tlmm /mnt/nvme/q30b m2out-doris
+# doris — two drives; 24 GB RAM, sweep to 12G
+CACHE_LIST="1G 4G 8G 12G" AB_CACHE=8G \
+    tools/m2_eval.sh ~/stores/q30b.tlmm /mnt/nvme0/q30b,/mnt/nvme1/q30b m2out-doris
 ```
 
 The drive list must be in the store's manifest order (the gate indexes the fio baseline to the
@@ -281,7 +291,7 @@ engineering estimates.
 
 - **No GPU.** Everything here is the CPU path. Do not install ROCm/CUDA for M2.
 - **The store.** Qwen3-30B-A3B at Q6_K experts / Q8_0 dense is ~28 GB (~7 GB per drive on
-  drogo, all of it on doris's 256 GB). Put it on the NVMe, never in the repo.
+  drogo, ~14 GB per drive on doris). Put it on the NVMe, never in the repo.
 - **One drive per shard.** `--drives` expects independent devices; no RAID layer. `tierlm-setup
   --drive` measures each so the placement is honest.
 - **Recompile is slow** (ingest + quantise + calibrate + place + validate) — ~20 min for the 30B
