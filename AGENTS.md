@@ -68,3 +68,22 @@ tools/m2_eval.sh STORE DRIVES OUT           # M2: cache sweep + I/O A/B -> summa
 - Four spaces, about 100 columns.
 - Prose in docs: plain English, short sentences, numbers with units, and say which numbers are
   measured and which are estimated.
+
+## Pitfalls
+
+- **Get exact marker bytes from source, never from prose.** The Qwen3 chat markers are C
+  string literals in `src/lib/tlm_chat.c` (`MK_IM_S`…`MK_TRS`); the eos is `eos_eot` in
+  `src/bin/tierlm.c`. To build a test tokenizer, extract the bytes —
+  `sed -n '14,19p' src/lib/tlm_chat.c | od -c` (or decode the escapes in Python) — do not
+  copy a description from a summary or handoff. `MK_TH` (`think`) and `MK_THS` (`/think`)
+  are an open/close pair differing only by the slash; `tlm_qwen3_chat_render` needs both.
+- **`tlm_bpe_decode` does not NUL-terminate** — it returns the byte count. Terminate the
+  buffer yourself before any string operation on the result (a `strdup`/`strcmp` on the raw
+  output reads past the heap block).
+- **`tlm_bpe_load` takes a directory**, not a file — it appends `/tokenizer.json`.
+- **Special-byte content gets mangled in tool inputs** (`\n`, `\u003c` become real bytes).
+  When writing marker/fixture content, build it from explicit byte-code lists, not string
+  literals. `tests/fixtures/qwen3_chat_tokenizer.json` is the reference for chat.
+- **Crash triage: build an ASan `tierlm` and reproduce** — it names the line faster than
+  adding prints. Prefer a standalone probe over instrumenting `src/lib/`; reverting
+  instrumentation is easy to botch (and `make test` must be clean before you commit).
