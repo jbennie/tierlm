@@ -217,4 +217,43 @@ if "$B/tlmc" compile "$T/src-bad" --out "$T/models/bad.tlmm" --drives "$T/nvme0"
 fi
 grep -q "not supported" "$T/bad.out" || { cat "$T/bad.out" >&2; fail "no rope rejection message"; }
 
+step "chat: multi-turn REPL with /reset and /think (Qwen3 tokenizer)"
+mkdir -p "$T/chat-tok"
+cp tests/fixtures/qwen3_chat_tokenizer.json "$T/chat-tok/tokenizer.json"
+if ! "$B/tierlm" chat "$T/models/exact.tlmm" --tokenizer "$T/chat-tok" --system "sys" -n 16 --seed 7 > "$T/chat.out" 2>&1 <<'CHATEOF'
+turn one
+turn two
+/think 1
+turn three
+/reset
+turn four
+/quit
+CHATEOF
+then
+    cat "$T/chat.out" >&2
+    fail "chat REPL exited nonzero"
+fi
+grep -q "turn failed" "$T/chat.out" && { cat "$T/chat.out" >&2; fail "chat: a turn failed"; }
+[ "$(grep -c '^you>' "$T/chat.out")" -ge 5 ] || fail "chat: expected >=5 prompts, got $(grep -c '^you>' "$T/chat.out")"
+
+step "serve: OpenAI-compatible HTTP (health, completion, 404, 400)"
+PORT=18321
+"$B/tierlm" serve "$T/models/exact.tlmm" --tokenizer "$T/chat-tok" --system "sys" -n 16 --seed 7 --port "$PORT" > "$T/serve.out" 2>&1 &
+SRV=$!
+tries=0
+until curl -s -o /dev/null "http://127.0.0.1:$PORT/health"; do
+    tries=$((tries + 1))
+    [ "$tries" -gt 100 ] && { kill "$SRV" 2>/dev/null; cat "$T/serve.out" >&2; fail "serve did not start"; }
+    sleep 0.1
+done
+curl -sf "http://127.0.0.1:$PORT/health" > "$T/health.json" || { kill "$SRV" 2>/dev/null; fail "GET /health"; }
+grep -q '"status":"ok"' "$T/health.json" || { kill "$SRV" 2>/dev/null; fail "health body wrong"; }
+curl -sf -X POST "http://127.0.0.1:$PORT/v1/chat/completions" -H 'Content-Type: application/json' \
+    -d '{"model":"t","messages":[{"role":"user","content":"hi"}]}' > "$T/comp.json" || { kill "$SRV" 2>/dev/null; cat "$T/comp.json" >&2; fail "POST completion"; }
+grep -q '"object":"chat.completion"' "$T/comp.json" || { kill "$SRV" 2>/dev/null; cat "$T/comp.json" >&2; fail "completion response shape"; }
+[ "$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$PORT/nope")" = "404" ] || { kill "$SRV" 2>/dev/null; fail "expected 404 on unknown path"; }
+[ "$(curl -s -o /dev/null -w '%{http_code}' -X POST "http://127.0.0.1:$PORT/v1/chat/completions" -d '{bad')" = "400" ] || { kill "$SRV" 2>/dev/null; fail "expected 400 on bad json"; }
+kill "$SRV" 2>/dev/null
+wait "$SRV" 2>/dev/null || true
+
 echo "e2e: ok"

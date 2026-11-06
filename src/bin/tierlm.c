@@ -19,6 +19,8 @@
  * Prompts are byte-level for synthetic models: token = byte mod vocab.
  */
 #include "tlm_bpe.h"
+#include "tlm_chat.h"
+#include "tlm_json.h"
 #include "tlm_cfg.h"
 #include "tlm_io.h"
 #include "tlm_model.h"
@@ -38,6 +40,10 @@
 #include <strings.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <signal.h>
+#include <sys/socket.h>
 
 #define TIERLM_VERSION "0.1"
 
@@ -87,7 +93,8 @@ static void fmt_bytes(uint64_t b, char *out, size_t cap) {
 /* ---- options shared by run and bench ------------------------------------- */
 typedef struct {
     const char *manifest, *prompt, *tokens, *etc, *warm, *kernel, *tokenizer;
-    int         n, stats, stats_json, print_tokens, prompt_len;
+    const char *system;
+    int         n, stats, stats_json, print_tokens, prompt_len, port, think;
     int         have_temp, have_seed;
     double      temp, top_p, min_p;
     uint64_t    seed;
@@ -129,6 +136,8 @@ static void parse_opts(opts *o, int argc, char **argv, int bench) {
     o->n = bench ? 64 : 32;
     o->prompt_len = 64;
     o->top_p = 1.0;
+    o->think = -1;
+    o->port = 8080;
     load_cfg(o, argc, argv);
     for (int i = 2; i < argc; i++) {
         const char *a = argv[i];
@@ -142,6 +151,9 @@ static void parse_opts(opts *o, int argc, char **argv, int bench) {
         else if (!strcmp(a, "--top-p")) o->top_p = frac_arg(need(argc, argv, &i), a, 0, 1);
         else if (!strcmp(a, "--min-p")) o->min_p = frac_arg(need(argc, argv, &i), a, 0, 1);
         else if (!strcmp(a, "--seed")) { o->seed = (uint64_t)num_arg(need(argc, argv, &i), a, 0, LONG_MAX); o->have_seed = 1; }
+        else if (!strcmp(a, "--system")) o->system = need(argc, argv, &i);
+        else if (!strcmp(a, "--think")) o->think = (int)num_arg(need(argc, argv, &i), a, 0, 1);
+        else if (!strcmp(a, "--port")) o->port = (int)num_arg(need(argc, argv, &i), a, 0, 65535);
         else if (!strcmp(a, "--stats")) o->stats = 1;
         else if (!strcmp(a, "--stats-json")) o->stats_json = 1;
         else if (!strcmp(a, "--print-tokens")) o->print_tokens = 1;
@@ -731,6 +743,444 @@ static int cmd_bench(int argc, char **argv) {
     return 0;
 }
 
+/* ---- chat / serve: multi-turn session --------------------------------------
+ * A session keeps one KV cache across turns. Each turn re-renders the whole
+ * history with the Qwen3 template; because the template is prefix-stable, the
+ * rendered prefix matches the ids already in the KV, so only the delta is
+ * prefilled. On any mismatch the KV is reset and re-prefilled from scratch
+ * (always correct, just slower). The reply is decoded from the generated ids
+ * and appended to the history. */
+typedef struct { char *role, *content; } cmsg;
+
+typedef struct {
+    runtime  r;
+    tlm_bpe *bpe;
+    tlm_kv  *kv;
+    cmsg    *msgs;
+    int      nmsgs, msgcap;
+    int     *kv_ids;              /* exact ids currently resident in the KV */
+    int      n_kv, kv_cap;
+    int      eos;                 /* eos token id, or -1 */
+    int      think;               /* tristate, as parsed */
+    double   temp, top_p, min_p;
+    uint64_t seed;
+    int      have_seed;
+    int      max_gen;
+    int      vocab, max_ctx;
+} session;
+
+static int session_push(session *S, const char *role, const char *content) {
+    if (S->nmsgs == S->msgcap) {
+        int nc = S->msgcap ? S->msgcap * 2 : 8;
+        cmsg *nm = (cmsg *)realloc(S->msgs, sizeof(cmsg) * (size_t)nc);
+        if (!nm) return -1;
+        S->msgs = nm;
+        S->msgcap = nc;
+    }
+    S->msgs[S->nmsgs].role = strdup(role);
+    S->msgs[S->nmsgs].content = strdup(content);
+    if (!S->msgs[S->nmsgs].role || !S->msgs[S->nmsgs].content) return -1;
+    S->nmsgs++;
+    return 0;
+}
+
+static int session_kv_reserve(session *S, int add) {
+    if (S->n_kv + add <= S->kv_cap) return 0;
+    int nc = S->kv_cap ? S->kv_cap : 1024;
+    while (nc < S->n_kv + add) nc *= 2;
+    int *nk = (int *)realloc(S->kv_ids, sizeof(int) * (size_t)nc);
+    if (!nk) return -1;
+    S->kv_ids = nk;
+    S->kv_cap = nc;
+    return 0;
+}
+
+static int session_render(session *S, int *ids, int cap) {
+    tlm_chat_msg *cm = (tlm_chat_msg *)malloc(sizeof(tlm_chat_msg) * (size_t)(S->nmsgs ? S->nmsgs : 1));
+    if (!cm) return -1;
+    for (int i = 0; i < S->nmsgs; i++) {
+        cm[i].role = S->msgs[i].role;
+        cm[i].content = S->msgs[i].content;
+        cm[i].content_len = 0;
+        cm[i].reasoning = NULL;
+        cm[i].reasoning_len = 0;
+    }
+    tlm_chat_opts co = {1, S->think};
+    int n = tlm_qwen3_chat_render(S->bpe, cm, S->nmsgs, &co, ids, cap);
+    free(cm);
+    return n;
+}
+
+typedef int (*session_tok_fn)(void *ctx, int tok);
+
+/* Append a user message, continue the KV, generate the reply (calling on_tok
+ * per token for live display), append the reply as an assistant message, and
+ * return the decoded reply in *out_text (malloc'd, or NULL when out_text is
+ * NULL). Returns 0 on success. */
+static int session_turn(session *S, const char *user, session_tok_fn on_tok, void *ctx,
+                        char **out_text) {
+    if (session_push(S, "user", user)) return -1;
+    const tlm_model_geom *g = tlm_model_geom_of(S->r.mdl);
+    S->vocab = (int)g->vocab;
+
+    int cap = S->n_kv + 1024, nfull = 0;
+    int *full = (int *)malloc(sizeof(int) * (size_t)cap);
+    if (!full) return -1;
+    for (;;) {
+        nfull = session_render(S, full, cap);
+        if (nfull >= 0) break;
+        if (cap >= (1 << 20)) { free(full); return -1; }   /* missing marker or other hard render error */
+        cap *= 2;
+        int *nf = (int *)realloc(full, sizeof(int) * (size_t)cap);
+        if (!nf) { free(full); return -1; }
+        full = nf;
+    }
+    if (nfull > S->max_ctx) { fprintf(stderr, "tierlm: history exceeds context (%d > %d)\n", nfull, S->max_ctx); free(full); return -1; }
+
+    int reset = 0;
+    for (int i = 0; i < S->n_kv; i++)
+        if (i >= nfull || S->kv_ids[i] != full[i]) { reset = 1; break; }
+    int delta_off;
+    if (reset) { tlm_kv_reset(S->kv); S->n_kv = 0; delta_off = 0; }
+    else delta_off = S->n_kv;
+
+    float *lg = (float *)malloc(sizeof(float) * (size_t)g->vocab);
+    if (!lg) { free(full); return -1; }
+    if (nfull > delta_off &&
+        tlm_model_prefill(S->r.mdl, S->kv, full + delta_off, nfull - delta_off, lg)) {
+        fprintf(stderr, "tierlm: prefill failed: %s\n", tlm_errmsg());
+        free(full); free(lg);
+        return -1;
+    }
+    for (int i = delta_off; i < nfull; i++) {
+        if (session_kv_reserve(S, 1)) { free(full); free(lg); return -1; }
+        S->kv_ids[S->n_kv++] = full[i];
+    }
+    free(full);
+
+    tlm_sampler s = {(float)S->temp, (float)S->top_p, (float)S->min_p, S->have_seed ? S->seed : 0};
+    uint64_t rng = 0;
+    int gen = 0, gencap = 256, ngen = 0;
+    int *gen_ids = (int *)malloc(sizeof(int) * (size_t)gencap);
+    if (!gen_ids) { free(lg); return -1; }
+    while (gen < S->max_gen && tlm_kv_len(S->kv) < tlm_kv_capacity(S->kv)) {
+        int tok = tlm_sample(&s, &rng, lg, S->vocab);
+        if (ngen == gencap) { gencap *= 2; int *ng = (int *)realloc(gen_ids, sizeof(int) * (size_t)gencap); if (!ng) { free(gen_ids); free(lg); return -1; } gen_ids = ng; }
+        gen_ids[ngen++] = tok;
+        if (on_tok && on_tok(ctx, tok)) break;
+        gen++;
+        if (S->eos >= 0 && tok == S->eos) { ngen--; break; }   /* drop the stop token */
+        if (tlm_model_step(S->r.mdl, S->kv, tok, lg)) { fprintf(stderr, "tierlm: step failed: %s\n", tlm_errmsg()); free(gen_ids); free(lg); return -1; }
+    }
+    free(lg);
+
+    size_t tcap = (size_t)ngen * 4 + 16;
+    char *text = (char *)malloc(tcap + 1);   /* +1 for the NUL terminator */
+    if (!text) { free(gen_ids); return -1; }
+    for (;;) {
+        int d = tlm_bpe_decode(S->bpe, gen_ids, ngen, 1, text, tcap);
+        if (d >= 0) { text[d] = 0; break; }  /* decode does not NUL-terminate */
+        tcap *= 2;
+        char *nt = (char *)realloc(text, tcap + 1);
+        if (!nt) { free(text); free(gen_ids); return -1; }
+        text = nt;
+    }
+    free(gen_ids);
+    if (session_push(S, "assistant", text)) { free(text); return -1; }
+    if (out_text) *out_text = text;
+    else free(text);
+    return 0;
+}
+
+static void session_free_msgs(session *S) {
+    for (int i = 0; i < S->nmsgs; i++) { free(S->msgs[i].role); free(S->msgs[i].content); }
+    free(S->msgs);
+    free(S->kv_ids);
+    S->msgs = NULL;
+    S->kv_ids = NULL;
+    S->nmsgs = S->msgcap = 0;
+    S->n_kv = S->kv_cap = 0;
+}
+
+/* ---- chat: interactive REPL ------------------------------------------------- */
+typedef struct { tlm_bpe_dec *dec; } chat_ctx;
+static int chat_emit(void *ctx, int tok) {
+    chat_ctx *c = (chat_ctx *)ctx;
+    char buf[512];
+    int k = tlm_bpe_dec_push(c->dec, tok, buf, sizeof buf);
+    if (k > 0) { fwrite(buf, 1, (size_t)k, stdout); fflush(stdout); }
+    return 0;
+}
+
+static int cmd_chat(int argc, char **argv) {
+    opts o;
+    parse_opts(&o, argc, argv, 0);
+    if (!o.manifest) die("usage: tierlm chat MANIFEST --tokenizer DIR [--system TEXT] [--think 0|1] [-n MAX] [runtime flags]");
+    if (!o.tokenizer) die("chat: --tokenizer <checkpoint dir> is required for text I/O");
+    char err[512] = "";
+    tlm_bpe *bpe = tlm_bpe_load(o.tokenizer, err, sizeof err);
+    if (!bpe) die("--tokenizer: %s", err);
+
+    session S;
+    memset(&S, 0, sizeof S);
+    S.bpe = bpe;
+    S.think = o.think;
+    S.temp = o.have_temp ? o.temp : 0.7;
+    S.top_p = o.top_p;
+    S.min_p = o.min_p;
+    S.seed = o.seed;
+    S.have_seed = o.have_seed;
+    S.max_gen = o.n > 0 ? o.n : 512;
+    const char eos_eot[] = {10, '<', 'e', 'o', 'f', 't', 'h', 'i', 'n', 'k', '>', 0};
+    S.eos = tlm_bpe_add_id(bpe, eos_eot, (int)(sizeof eos_eot - 1));
+    rt_open(&S.r, &o);
+    const tlm_model_geom *g = tlm_model_geom_of(S.r.mdl);
+    S.max_ctx = g->max_ctx ? (int)g->max_ctx : 32768;
+    S.kv = tlm_kv_new(S.r.mdl, S.max_ctx);
+    if (!S.kv) die("%s", tlm_errmsg());
+    if (o.system && *o.system && session_push(&S, "system", o.system)) die("out of memory");
+    tlm_bpe_dec *dec = tlm_bpe_dec_new(bpe, 1);
+    chat_ctx cc = {dec};
+    char *line = NULL;
+    size_t lcap = 0;
+    puts("tierlm chat: /help for commands, /quit to exit");
+    for (;;) {
+        printf("you> ");
+        fflush(stdout);
+        if (!getline(&line, &lcap, stdin)) { puts(""); break; }
+        size_t L = strlen(line);
+        while (L && (line[L-1] == 10 || line[L-1] == 13)) line[--L] = 0;
+        if (!L) continue;
+        if (!strcmp(line, "/quit") || !strcmp(line, "/exit") || !strcmp(line, "/q")) break;
+        if (!strcmp(line, "/help") || !strcmp(line, "/?")) {
+            puts("  /system TEXT   set the system prompt (resets the conversation)");
+            puts("  /reset         clear the conversation and KV");
+            puts("  /think 0|1     toggle reasoning mode (resets the conversation)");
+            puts("  /quit          exit");
+            continue;
+        }
+        if (!strncmp(line, "/system ", 8)) {
+            session_free_msgs(&S); S.nmsgs = S.msgcap = 0; S.n_kv = 0; tlm_kv_reset(S.kv);
+            if (session_push(&S, "system", line + 8)) die("out of memory");
+            continue;
+        }
+        if (!strcmp(line, "/reset")) {
+            session_free_msgs(&S); S.nmsgs = S.msgcap = 0; S.n_kv = 0; tlm_kv_reset(S.kv);
+            if (o.system && *o.system) session_push(&S, "system", o.system);
+            continue;
+        }
+        if (!strncmp(line, "/think ", 7)) {
+            int t = atoi(line + 7);
+            session_free_msgs(&S); S.nmsgs = S.msgcap = 0; S.n_kv = 0; tlm_kv_reset(S.kv);
+            S.think = t;
+            if (o.system && *o.system) session_push(&S, "system", o.system);
+            continue;
+        }
+        tlm_bpe_dec_reset(dec);
+        puts("");
+        if (session_turn(&S, line, chat_emit, &cc, NULL)) {
+            fputs("tierlm: turn failed; conversation reset", stderr);
+            fputc(10, stderr);
+            session_free_msgs(&S); S.nmsgs = S.msgcap = 0; S.n_kv = 0; tlm_kv_reset(S.kv);
+            if (o.system && *o.system) session_push(&S, "system", o.system);
+        } else {
+            char tail[512];
+            int k = tlm_bpe_dec_flush(dec, tail, sizeof tail);
+            if (k > 0) fwrite(tail, 1, (size_t)k, stdout);
+            fputc(10, stdout);
+            fflush(stdout);
+        }
+    }
+    free(line);
+    tlm_bpe_dec_free(dec);
+    session_free_msgs(&S);
+    tlm_kv_free(S.kv);
+    tlm_bpe_free(bpe);
+    rt_close(&S.r, &o);
+    tlm_cfg_free(o.cfg);
+    return 0;
+}
+
+/* ---- serve: OpenAI-compatible HTTP ---------------------------------------- */
+static void http_send(int fd, int code, const char *body, size_t blen) {
+    static const char CRLF[] = {13, 10};
+    const char *status = code == 200 ? "200 OK" : code == 404 ? "404 Not Found"
+                        : code == 400 ? "400 Bad Request" : "500 Internal Server Error";
+    char line[512];
+    int n;
+    n = snprintf(line, sizeof line, "HTTP/1.1 %s", status);
+    if (n > 0) write(fd, line, (size_t)n);
+    write(fd, CRLF, 2);
+    n = snprintf(line, sizeof line, "Content-Type: application/json");
+    if (n > 0) write(fd, line, (size_t)n);
+    write(fd, CRLF, 2);
+    n = snprintf(line, sizeof line, "Content-Length: %zu", blen);
+    if (n > 0) write(fd, line, (size_t)n);
+    write(fd, CRLF, 2);
+    n = snprintf(line, sizeof line, "Connection: close");
+    if (n > 0) write(fd, line, (size_t)n);
+    write(fd, CRLF, 2);
+    write(fd, CRLF, 2);
+    if (blen) write(fd, body, blen);
+}
+
+static char *err_json(const char *msg) {
+    size_t mlen = strlen(msg);
+    size_t elen = tlm_json_escape(NULL, 0, msg, mlen);
+    char *out = (char *)malloc(elen + 64);
+    if (!out) return NULL;
+    int off = snprintf(out, elen + 64, "{\"error\":{\"message\":\"");
+    tlm_json_escape(out + off, (size_t)off + 64, msg, mlen);
+    off += (int)elen;
+    snprintf(out + off, (size_t)off + 64, "\"}");
+    return out;
+}
+
+static char *completion_json(const char *reply) {
+    size_t rlen = strlen(reply);
+    size_t elen = tlm_json_escape(NULL, 0, reply, rlen);
+    size_t cap = elen + 320;
+    char *out = (char *)malloc(cap);
+    if (!out) return NULL;
+    unsigned long long now_ms = (unsigned long long)(tlm_now_ns() / 1000000ULL);
+    int off = snprintf(out, cap,
+        "{\"id\":\"chatcmpl-%llu\",\"object\":\"chat.completion\",\"created\":%llu,\"model\":\"tierlm\",\"choices\":[{\"index\":0,\"finish_reason\":\"stop\",\"message\":{\"role\":\"assistant\",\"content\":\"",
+        now_ms, now_ms);
+    if (off < 0) { free(out); return NULL; }
+    tlm_json_escape(out + off, cap - (size_t)off, reply, rlen);
+    off += (int)elen;
+    snprintf(out + off, cap - (size_t)off, "\"}}]}");
+    return out;
+}
+
+static void handle_conn(session *S, const char *sys, int fd) {
+    static const char CRLFCRLF[] = {13, 10, 13, 10};
+    size_t cap = 1u << 20, n = 0;
+    char *buf = (char *)malloc(cap);
+    if (!buf) return;
+    char *hend = NULL;
+    while (n < cap && !hend) {
+        ssize_t r = read(fd, buf + n, cap - n);
+        if (r <= 0) break;
+        n += (size_t)r;
+        if (n < cap) buf[n] = 0;
+        hend = (char *)memmem(buf, n, CRLFCRLF, 4);
+    }
+    if (!hend) { free(buf); return; }
+    size_t hlen = (size_t)(hend - buf) + 4;
+    char method[8] = {0}, path[512] = {0};
+    if (sscanf(buf, "%7s %511s", method, path) < 2) { free(buf); return; }
+    size_t clen = 0;
+    const char *cl = strcasestr(buf, "Content-Length:");
+    if (cl) clen = (size_t)strtoul(cl + 15, NULL, 10);
+    size_t body_have = n - hlen;
+    while (body_have < clen && body_have < cap) {
+        ssize_t r = read(fd, buf + hlen + body_have, cap - hlen - body_have);
+        if (r <= 0) break;
+        body_have += (size_t)r;
+    }
+    char *body = buf + hlen;
+    char *resp = NULL;
+    int code = 200;
+    if (!strcmp(method, "GET") && !strcmp(path, "/health")) {
+        resp = strdup("{\"status\":\"ok\"}");
+    } else if (!strcmp(method, "POST") && !strcmp(path, "/v1/chat/completions")) {
+        char emsg[256] = "";
+        session_free_msgs(S); S->nmsgs = S->msgcap = 0; S->n_kv = 0; tlm_kv_reset(S->kv);
+        if (sys && *sys) session_push(S, "system", sys);
+        char jerr[256] = "";
+        tlm_json *j = tlm_json_parse(body, body_have, jerr, sizeof jerr);
+        if (!j) {
+            code = 400;
+            snprintf(emsg, sizeof emsg, "json: %s", jerr);
+        } else {
+            const tlm_jval *msgs = tlm_jobj_get(tlm_json_root(j), "messages");
+            if (!msgs || msgs->type != TLM_J_ARR || tlm_jlen(msgs) == 0) {
+                code = 400;
+                snprintf(emsg, sizeof emsg, "missing messages");
+            } else {
+                size_t nm = tlm_jlen(msgs);
+                for (size_t i = 0; i < nm && code == 200; i++) {
+                    const tlm_jval *m = tlm_jat(msgs, i);
+                    const char *role = tlm_jstr(tlm_jobj_get(m, "role"), "user");
+                    const char *content = tlm_jstr(tlm_jobj_get(m, "content"), "");
+                    if (i + 1 == nm) {
+                        if (session_turn(S, content, NULL, NULL, &resp)) { code = 500; free(resp); resp = NULL; snprintf(emsg, sizeof emsg, "generation failed"); }
+                    } else if (session_push(S, role, content)) {
+                        code = 500;
+                        snprintf(emsg, sizeof emsg, "out of memory");
+                    }
+                }
+                if (code == 200 && resp) { char *c = completion_json(resp); free(resp); resp = c; }
+            }
+            tlm_json_free(j);
+        }
+        if (code != 200) { free(resp); resp = err_json(emsg); }
+    } else {
+        code = 404;
+        resp = strdup("{\"error\":{\"message\":\"not found\"}}");
+    }
+    if (!resp) resp = strdup("{}");
+    http_send(fd, code, resp, strlen(resp));
+    free(resp);
+    free(buf);
+}
+
+static int cmd_serve(int argc, char **argv) {
+    opts o;
+    parse_opts(&o, argc, argv, 0);
+    if (!o.manifest) die("usage: tierlm serve MANIFEST --tokenizer DIR [--system TEXT] [--think 0|1] [--port N] [runtime flags]");
+    if (!o.tokenizer) die("serve: --tokenizer <checkpoint dir> is required for text I/O");
+    char err[512] = "";
+    tlm_bpe *bpe = tlm_bpe_load(o.tokenizer, err, sizeof err);
+    if (!bpe) die("--tokenizer: %s", err);
+    session S;
+    memset(&S, 0, sizeof S);
+    S.bpe = bpe;
+    S.think = o.think;
+    S.temp = o.have_temp ? o.temp : 0.7;
+    S.top_p = o.top_p;
+    S.min_p = o.min_p;
+    S.seed = o.seed;
+    S.have_seed = o.have_seed;
+    S.max_gen = o.n > 0 ? o.n : 512;
+    const char eos_eot[] = {10, '<', 'e', 'o', 'f', 't', 'h', 'i', 'n', 'k', '>', 0};
+    S.eos = tlm_bpe_add_id(bpe, eos_eot, (int)(sizeof eos_eot - 1));
+    rt_open(&S.r, &o);
+    const tlm_model_geom *g = tlm_model_geom_of(S.r.mdl);
+    S.max_ctx = g->max_ctx ? (int)g->max_ctx : 32768;
+    S.kv = tlm_kv_new(S.r.mdl, S.max_ctx);
+    if (!S.kv) die("%s", tlm_errmsg());
+    signal(SIGPIPE, SIG_IGN);
+    int srv = socket(AF_INET, SOCK_STREAM, 0);
+    if (srv < 0) die("socket: %s", strerror(errno));
+    int one = 1;
+    setsockopt(srv, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof addr);
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    addr.sin_port = htons((uint16_t)o.port);
+    if (bind(srv, (struct sockaddr *)&addr, sizeof addr) < 0) die("bind 127.0.0.1:%d: %s", o.port, strerror(errno));
+    if (listen(srv, 16) < 0) die("listen: %s", strerror(errno));
+    fprintf(stderr, "tierlm: serving on http://127.0.0.1:%d (POST /v1/chat/completions, GET /health)", o.port);
+    fputc(10, stderr);
+    const char *sys = o.system;
+    for (;;) {
+        int fd = accept(srv, NULL, NULL);
+        if (fd < 0) { if (errno == EINTR) continue; break; }
+        handle_conn(&S, sys, fd);
+        close(fd);
+    }
+    close(srv);
+    session_free_msgs(&S);
+    tlm_kv_free(S.kv);
+    tlm_bpe_free(bpe);
+    rt_close(&S.r, &o);
+    tlm_cfg_free(o.cfg);
+    return 0;
+}
+
 /* ---- config show / check ------------------------------------------------------ */
 static int cmd_config(int argc, char **argv) {
     if (argc < 3) die("usage: tierlm config show|check [--origin] [--etc DIR]");
@@ -793,6 +1243,8 @@ static void usage(FILE *f) {
             "               [--print-tokens]\n"
             "  tierlm bench MANIFEST [--prompt-len N] [-n N] [runtime flags as for run]\n"
             "  tierlm oracle MANIFEST --tokens 1,2,3   (per-position top-k dump, P-121)\n"
+            "  tierlm chat   MANIFEST --tokenizer DIR [--system TEXT] [--think 0|1] [-n MAX] [runtime flags]\n"
+            "  tierlm serve  MANIFEST --tokenizer DIR [--system TEXT] [--think 0|1] [--port N] [runtime flags]\n"
             "  tierlm config show [--origin] [--etc DIR]\n"
             "  tierlm config check [--etc DIR]\n",
             TIERLM_VERSION);
@@ -808,6 +1260,8 @@ int main(int argc, char **argv) {
     if (!strcmp(argv[1], "run")) return cmd_run(argc, argv);
     if (!strcmp(argv[1], "bench")) return cmd_bench(argc, argv);
     if (!strcmp(argv[1], "oracle")) return cmd_oracle(argc, argv);
+    if (!strcmp(argv[1], "chat")) return cmd_chat(argc, argv);
+    if (!strcmp(argv[1], "serve")) return cmd_serve(argc, argv);
     if (!strcmp(argv[1], "config")) return cmd_config(argc, argv);
     usage(stderr);
     return 2;
